@@ -1506,7 +1506,8 @@ class TestToolRegistry:
     def test_get_schemas(self):
         registry = vc.ToolRegistry().register_defaults()
         schemas = registry.get_schemas()
-        assert len(schemas) == 14  # 9 base + 4 task tools + AskUserQuestion
+        # 9 base + 4 task tools + AskUserQuestion + 3 bg-job tools (BashOutput, KillBash, ListBgJobs)
+        assert len(schemas) == 17
         for s in schemas:
             assert s["type"] == "function"
             assert "function" in s
@@ -11029,3 +11030,219 @@ class TestToolSearch:
         # JSON schema rendered with description
         assert '"name": "foo"' in r
         assert '"description"' in r
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Background bash jobs — BashOutput / KillBash / ListBgJobs / notifications
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _wait_until(predicate, timeout=5.0, interval=0.05):
+    """Poll `predicate()` until truthy or timeout. Returns the last value."""
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        last = predicate()
+        if last:
+            return last
+        time.sleep(interval)
+    return last
+
+
+def _clear_bg_tasks():
+    with vc._bg_tasks_lock:
+        vc._bg_tasks.clear()
+
+
+class TestBashOutputTool:
+    def setup_method(self):
+        _clear_bg_tasks()
+
+    def teardown_method(self):
+        _clear_bg_tasks()
+
+    def test_unknown_job_id_errors(self):
+        r = vc.BashOutputTool().execute({"job_id": "bg_99999"})
+        assert "unknown" in r.lower() or "Error" in r
+
+    def test_missing_job_id_errors(self):
+        r = vc.BashOutputTool().execute({"job_id": "  "})
+        assert r.startswith("Error:")
+
+    def test_streams_lines_during_run(self):
+        bash = vc.BashTool()
+        spawn = bash.execute({
+            "command": "for i in 1 2 3; do echo line$i; sleep 0.05; done",
+            "run_in_background": True,
+        })
+        m = re.search(r'(bg_\d+)', spawn)
+        assert m
+        tid = m.group(1)
+        # Wait until at least one line accumulated
+        out = _wait_until(lambda: vc.BashOutputTool().execute({"job_id": tid})
+                          if "line1" in vc.BashOutputTool().execute({"job_id": tid})
+                          else None, timeout=3.0)
+        assert out is not None
+        assert "job:" in out
+        assert "line1" in out
+
+    def test_since_line_skips_seen_output(self):
+        bash = vc.BashTool()
+        spawn = bash.execute({
+            "command": "for i in 1 2 3 4 5; do echo line$i; done",
+            "run_in_background": True,
+        })
+        tid = re.search(r'(bg_\d+)', spawn).group(1)
+        # Wait until job finishes
+        _wait_until(lambda: vc._bg_tasks.get(tid, {}).get("exit_code") is not None,
+                    timeout=5.0)
+        out_full = vc.BashOutputTool().execute({"job_id": tid})
+        out_skip = vc.BashOutputTool().execute({"job_id": tid, "since_line": 3})
+        # Full output should mention all 5 lines; skipped output should drop early ones
+        assert "line1" in out_full
+        assert "line5" in out_full
+        assert "line1" not in out_skip
+        assert "line5" in out_skip
+
+    def test_completed_job_shows_exit_status(self):
+        bash = vc.BashTool()
+        spawn = bash.execute({"command": "exit 7", "run_in_background": True})
+        tid = re.search(r'(bg_\d+)', spawn).group(1)
+        _wait_until(lambda: vc._bg_tasks.get(tid, {}).get("exit_code") is not None,
+                    timeout=5.0)
+        out = vc.BashOutputTool().execute({"job_id": tid})
+        assert "exit 7" in out
+
+
+class TestKillBashTool:
+    def setup_method(self):
+        _clear_bg_tasks()
+
+    def teardown_method(self):
+        _clear_bg_tasks()
+
+    def test_unknown_job_errors(self):
+        r = vc.KillBashTool().execute({"job_id": "bg_99999"})
+        assert "unknown" in r.lower() or "Error" in r
+
+    def test_missing_job_id_errors(self):
+        r = vc.KillBashTool().execute({"job_id": ""})
+        assert r.startswith("Error:")
+
+    def test_kills_running_job(self):
+        bash = vc.BashTool()
+        spawn = bash.execute({"command": "sleep 30", "run_in_background": True})
+        tid = re.search(r'(bg_\d+)', spawn).group(1)
+        # Make sure proc is running
+        time.sleep(0.1)
+        r = vc.KillBashTool().execute({"job_id": tid})
+        assert "termination" in r.lower() or "Sent" in r
+        # Wait for reaper to record exit_code
+        _wait_until(lambda: vc._bg_tasks.get(tid, {}).get("exit_code") is not None,
+                    timeout=5.0)
+        with vc._bg_tasks_lock:
+            assert vc._bg_tasks[tid].get("killed") is True
+
+    def test_already_finished_returns_finished_msg(self):
+        bash = vc.BashTool()
+        spawn = bash.execute({"command": "echo done", "run_in_background": True})
+        tid = re.search(r'(bg_\d+)', spawn).group(1)
+        _wait_until(lambda: vc._bg_tasks.get(tid, {}).get("exit_code") is not None,
+                    timeout=5.0)
+        r = vc.KillBashTool().execute({"job_id": tid})
+        assert "already finished" in r
+
+
+class TestListBgJobsTool:
+    def setup_method(self):
+        _clear_bg_tasks()
+
+    def teardown_method(self):
+        _clear_bg_tasks()
+
+    def test_empty(self):
+        assert vc.ListBgJobsTool().execute({}) == "No background jobs."
+
+    def test_lists_running_and_done(self):
+        bash = vc.BashTool()
+        s1 = bash.execute({"command": "echo a", "run_in_background": True})
+        s2 = bash.execute({"command": "sleep 10", "run_in_background": True})
+        t1 = re.search(r'(bg_\d+)', s1).group(1)
+        t2 = re.search(r'(bg_\d+)', s2).group(1)
+        # Wait for the echo job to finish
+        _wait_until(lambda: vc._bg_tasks.get(t1, {}).get("exit_code") is not None,
+                    timeout=5.0)
+        out = vc.ListBgJobsTool().execute({})
+        assert t1 in out
+        assert t2 in out
+        # one running, one exited
+        assert "running" in out
+        assert "exit 0" in out
+        # Cleanup: kill the long-running one
+        vc.KillBashTool().execute({"job_id": t2})
+
+
+class TestBgCompletionNotifications:
+    def setup_method(self):
+        _clear_bg_tasks()
+
+    def teardown_method(self):
+        _clear_bg_tasks()
+
+    def test_returns_only_unnotified(self):
+        bash = vc.BashTool()
+        spawn = bash.execute({"command": "echo done", "run_in_background": True})
+        tid = re.search(r'(bg_\d+)', spawn).group(1)
+        _wait_until(lambda: vc._bg_tasks.get(tid, {}).get("exit_code") is not None,
+                    timeout=5.0)
+        first = vc._consume_completed_bg_notifications()
+        assert any(j["id"] == tid for j in first)
+        # Second call must NOT re-announce
+        second = vc._consume_completed_bg_notifications()
+        assert all(j["id"] != tid for j in second)
+
+    def test_running_jobs_are_not_returned(self):
+        bash = vc.BashTool()
+        spawn = bash.execute({"command": "sleep 10", "run_in_background": True})
+        tid = re.search(r'(bg_\d+)', spawn).group(1)
+        # Don't wait — job is still running
+        result = vc._consume_completed_bg_notifications()
+        assert all(j["id"] != tid for j in result)
+        # Cleanup
+        vc.KillBashTool().execute({"job_id": tid})
+
+    def test_killed_job_marked_in_notification(self):
+        bash = vc.BashTool()
+        spawn = bash.execute({"command": "sleep 30", "run_in_background": True})
+        tid = re.search(r'(bg_\d+)', spawn).group(1)
+        time.sleep(0.1)
+        vc.KillBashTool().execute({"job_id": tid})
+        _wait_until(lambda: vc._bg_tasks.get(tid, {}).get("exit_code") is not None,
+                    timeout=5.0)
+        notes = vc._consume_completed_bg_notifications()
+        match = next((j for j in notes if j["id"] == tid), None)
+        assert match is not None
+        assert match["killed"] is True
+
+
+class TestBgShutdown:
+    def setup_method(self):
+        _clear_bg_tasks()
+
+    def teardown_method(self):
+        _clear_bg_tasks()
+
+    def test_shutdown_with_empty_dict(self):
+        # Should not raise
+        vc._shutdown_bg_jobs()
+
+    def test_shutdown_terminates_running(self):
+        bash = vc.BashTool()
+        spawn = bash.execute({"command": "sleep 30", "run_in_background": True})
+        tid = re.search(r'(bg_\d+)', spawn).group(1)
+        time.sleep(0.1)
+        vc._shutdown_bg_jobs()
+        # Reaper should record exit_code shortly
+        _wait_until(lambda: vc._bg_tasks.get(tid, {}).get("exit_code") is not None,
+                    timeout=5.0)
+        with vc._bg_tasks_lock:
+            assert vc._bg_tasks[tid]["exit_code"] is not None

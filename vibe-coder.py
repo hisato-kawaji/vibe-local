@@ -61,11 +61,22 @@ except ImportError:
 _print_lock = threading.Lock()
 from pathlib import Path
 
-# Background command store: task_id -> {"thread": Thread, "result": str|None, "command": str, "start": float}
+# Background command store. Each entry is a dict keyed by task_id ("bg_N"):
+#   thread        : reader Thread (None for inline error)
+#   proc          : subprocess.Popen (None when spawn failed)
+#   command       : original command string
+#   start         : monotonic-ish start timestamp (time.time())
+#   lines         : list[str] — accumulated stdout/stderr lines (live)
+#   exit_code     : int|None — None while running, integer rc when done
+#   result        : str|None — finalized output text when done (legacy field)
+#   notified      : bool — whether the agent has informed the LLM about completion
+#   killed        : bool — whether the user / watchdog requested termination
 _bg_tasks = {}
 _bg_task_counter = [0]
 _bg_tasks_lock = threading.Lock()
-MAX_BG_TASKS = 50  # Prevent unbounded memory growth
+MAX_BG_TASKS = 50           # Prevent unbounded memory growth
+BG_LINE_CAP = 5000          # Per-job line ring buffer cap (~bytes-bounded by lines)
+BG_OUTPUT_TRUNCATE = 30000  # Final result string max length (legacy)
 
 # Active scroll region reference (set during agent execution)
 _active_scroll_region = None
@@ -2305,11 +2316,11 @@ class BashTool(Tool):
                 entry = _bg_tasks.get(tid)
             if not entry:
                 return f"Error: unknown background task '{tid}'"
-            if entry["result"] is None:
+            if entry.get("result") is None:
                 elapsed = int(time.time() - entry["start"])
                 return f"Task {tid} still running ({elapsed}s elapsed). Command: {entry['command']}"
             result = entry["result"]
-            # Evict completed task after returning its result
+            # Evict the completed entry so it doesn't re-fire as a notification.
             with _bg_tasks_lock:
                 _bg_tasks.pop(tid, None)
             return f"Task {tid} completed:\n{result}"
@@ -2362,68 +2373,116 @@ class BashTool(Tool):
 
         # --- End security checks ---
 
-        # run_in_background: spawn in thread, return task ID immediately
+        # run_in_background: spawn with Popen + reader thread for streaming output
         if params.get("run_in_background", False):
-            with _bg_tasks_lock:
-                _bg_task_counter[0] += 1
-                task_id = f"bg_{_bg_task_counter[0]}"
-            # Build sanitized env for background commands (same as foreground)
             bg_clean_env = self._build_clean_env()
-            def _run_bg(tid, cmd, t_s):
-                try:
-                    _bg_pgroup = platform.system() != "Windows"
-                    proc = subprocess.Popen(
-                        cmd, shell=True, stdin=subprocess.DEVNULL,
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        text=True, encoding="utf-8", errors="replace",
-                        cwd=os.getcwd(), env=bg_clean_env,
-                        start_new_session=_bg_pgroup,
-                    )
-                    stdout, stderr = proc.communicate(timeout=t_s)
-                    out = (stdout or "") + ("\n" + stderr if stderr else "")
-                    if proc.returncode != 0:
-                        out += f"\n(exit code: {proc.returncode})"
-                    if len(out) > 30000:
-                        out = out[:15000] + "\n...(truncated)...\n" + out[-15000:]
-                except subprocess.TimeoutExpired:
-                    # Kill entire process group on Unix, then the process itself
-                    if hasattr(os, "killpg"):
-                        try:
-                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                        except (OSError, ProcessLookupError):
-                            pass
-                    proc.kill()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        pass  # Process may be truly stuck — OS will reap eventually
-                    out = f"Error: background command timed out after {int(t_s)}s"
-                except Exception as e:
-                    out = f"Error: {e}"
-                with _bg_tasks_lock:
-                    _bg_tasks[tid]["result"] = out.strip() or "(no output)"
             with _bg_tasks_lock:
-                # Evict completed tasks older than 1 hour, then enforce cap
+                # Evict stale completed tasks (> 1 hour), then enforce max cap
                 now = time.time()
                 stale = [k for k, v in _bg_tasks.items()
                          if v.get("result") is not None and now - v.get("start", 0) > 3600]
                 for k in stale:
                     del _bg_tasks[k]
                 if len(_bg_tasks) >= MAX_BG_TASKS:
-                    # Remove oldest completed task
-                    oldest = min((k for k, v in _bg_tasks.items() if v.get("result") is not None),
-                                 key=lambda k: _bg_tasks[k].get("start", 0), default=None)
+                    oldest = min(
+                        (k for k, v in _bg_tasks.items() if v.get("result") is not None),
+                        key=lambda k: _bg_tasks[k].get("start", 0), default=None)
                     if oldest:
                         del _bg_tasks[oldest]
                     else:
                         return f"Error: too many background tasks ({MAX_BG_TASKS}). Wait for some to complete."
-                _bg_tasks[task_id] = {"thread": None, "result": None,
-                                       "command": command, "start": time.time()}
-            t = threading.Thread(target=_run_bg, args=(task_id, command, timeout_s), daemon=True)
+                _bg_task_counter[0] += 1
+                task_id = f"bg_{_bg_task_counter[0]}"
+                _bg_tasks[task_id] = {
+                    "thread": None, "proc": None, "command": command,
+                    "start": time.time(), "lines": [],
+                    "exit_code": None, "result": None,
+                    "notified": False, "killed": False,
+                }
+            try:
+                _bg_pgroup = platform.system() != "Windows"
+                proc = subprocess.Popen(
+                    command, shell=True, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="replace",
+                    cwd=os.getcwd(), env=bg_clean_env,
+                    start_new_session=_bg_pgroup,
+                    bufsize=1,  # line-buffered
+                )
+            except Exception as e:
+                with _bg_tasks_lock:
+                    entry = _bg_tasks.get(task_id)
+                    if entry is not None:
+                        entry["result"] = f"Error: failed to spawn: {e}"
+                        entry["exit_code"] = -1
+                return f"Error: failed to spawn background task: {e}"
             with _bg_tasks_lock:
-                _bg_tasks[task_id]["thread"] = t
-            t.start()
-            return f"Background task started: {task_id}\nUse Bash(command='bg_status {task_id}') to check result."
+                _bg_tasks[task_id]["proc"] = proc
+
+            def _reader_loop(tid, p):
+                try:
+                    if p.stdout is not None:
+                        for line in p.stdout:
+                            with _bg_tasks_lock:
+                                e = _bg_tasks.get(tid)
+                                if e is None:
+                                    break
+                                e["lines"].append(line.rstrip("\n"))
+                                if len(e["lines"]) > BG_LINE_CAP:
+                                    e["lines"] = e["lines"][-BG_LINE_CAP:]
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        rc = p.wait()
+                    except Exception:
+                        rc = -1
+                    with _bg_tasks_lock:
+                        e = _bg_tasks.get(tid)
+                        if e is not None:
+                            e["exit_code"] = rc
+                            joined = "\n".join(e["lines"]).strip()
+                            if len(joined) > BG_OUTPUT_TRUNCATE:
+                                half = BG_OUTPUT_TRUNCATE // 2
+                                joined = joined[:half] + "\n...(truncated)...\n" + joined[-half:]
+                            if e.get("killed"):
+                                e["result"] = (joined + ("\n" if joined else "")
+                                               + "(terminated by user)")
+                            elif rc != 0:
+                                e["result"] = (joined + ("\n" if joined else "")
+                                               + f"(exit code: {rc})")
+                            else:
+                                e["result"] = joined or "(no output)"
+
+            def _watchdog(tid, p, t_s):
+                try:
+                    p.wait(timeout=t_s)
+                except subprocess.TimeoutExpired:
+                    with _bg_tasks_lock:
+                        e = _bg_tasks.get(tid)
+                        if e is not None and e.get("exit_code") is None:
+                            e["killed"] = True
+                            e["lines"].append(f"(watchdog: timed out after {int(t_s)}s)")
+                    if hasattr(os, "killpg") and platform.system() != "Windows":
+                        try:
+                            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                        except (OSError, ProcessLookupError):
+                            pass
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+
+            t_reader = threading.Thread(target=_reader_loop, args=(task_id, proc), daemon=True)
+            t_watchdog = threading.Thread(target=_watchdog,
+                                          args=(task_id, proc, timeout_s), daemon=True)
+            with _bg_tasks_lock:
+                _bg_tasks[task_id]["thread"] = t_reader
+            t_reader.start()
+            t_watchdog.start()
+            return (f"Background task started: {task_id}\n"
+                    f"Use BashOutput(job_id='{task_id}') to stream output, or "
+                    f"Bash(command='bg_status {task_id}') for the legacy summary.")
 
         try:
             clean_env = self._build_clean_env()
@@ -2476,6 +2535,203 @@ class BashTool(Tool):
             return output.strip()
         except Exception as e:
             return f"Error: {e}"
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Background-job inspection tools — read output, kill, list
+# ════════════════════════════════════════════════════════════════════════════════
+
+class BashOutputTool(Tool):
+    """Read accumulated output of a background bash job (live, line-by-line)."""
+    name = "BashOutput"
+    description = (
+        "Read the live output of a background bash job started with "
+        "Bash(run_in_background=true). Returns lines accumulated so far plus the "
+        "current run status and elapsed time. Use `since_line` to skip lines "
+        "you have already seen so successive polls only return new output."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "job_id": {
+                "type": "string",
+                "description": "The bg_N task id returned by Bash(run_in_background=true)",
+            },
+            "since_line": {
+                "type": "number",
+                "description": "0-indexed line number to start from (default 0)",
+            },
+        },
+        "required": ["job_id"],
+    }
+
+    def execute(self, params):
+        job_id = (params.get("job_id") or "").strip()
+        if not job_id:
+            return "Error: job_id is required"
+        try:
+            since = max(0, int(params.get("since_line", 0)))
+        except (TypeError, ValueError):
+            since = 0
+        with _bg_tasks_lock:
+            entry = _bg_tasks.get(job_id)
+            if entry is None:
+                return f"Error: unknown background job '{job_id}'"
+            lines_snapshot = list(entry.get("lines") or [])
+            exit_code = entry.get("exit_code")
+            command = entry.get("command", "")
+            start = entry.get("start", time.time())
+            killed = bool(entry.get("killed"))
+        status = ("running" if exit_code is None
+                  else ("killed" if killed else f"exit {exit_code}"))
+        elapsed = int(time.time() - start)
+        new_lines = lines_snapshot[since:]
+        head = (
+            f"job: {job_id} | status: {status} | elapsed: {elapsed}s | "
+            f"total_lines: {len(lines_snapshot)} | command: {command[:80]}"
+        )
+        if not new_lines:
+            return head + "\n(no new output)"
+        body = "\n".join(new_lines)
+        if len(body) > BG_OUTPUT_TRUNCATE:
+            half = BG_OUTPUT_TRUNCATE // 2
+            body = body[:half] + "\n...(truncated)...\n" + body[-half:]
+        return head + "\n" + body
+
+
+class KillBashTool(Tool):
+    """Terminate a running background bash job."""
+    name = "KillBash"
+    description = (
+        "Send SIGTERM (then SIGKILL after 2 seconds if still alive) to a "
+        "running background job spawned with Bash(run_in_background=true). "
+        "Has no effect on jobs that already finished."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "job_id": {
+                "type": "string",
+                "description": "The bg_N task id to terminate",
+            },
+        },
+        "required": ["job_id"],
+    }
+
+    def execute(self, params):
+        job_id = (params.get("job_id") or "").strip()
+        if not job_id:
+            return "Error: job_id is required"
+        with _bg_tasks_lock:
+            entry = _bg_tasks.get(job_id)
+            if entry is None:
+                return f"Error: unknown background job '{job_id}'"
+            if entry.get("exit_code") is not None:
+                return f"Job {job_id} already finished (status: exit {entry['exit_code']})."
+            proc = entry.get("proc")
+            entry["killed"] = True
+        if proc is None:
+            return f"Job {job_id} has no live process; nothing to kill."
+        try:
+            if hasattr(os, "killpg") and platform.system() != "Windows":
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except (OSError, ProcessLookupError):
+                    pass
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                if hasattr(os, "killpg") and platform.system() != "Windows":
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (OSError, ProcessLookupError):
+                        pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        except Exception as e:
+            return f"Error while killing {job_id}: {e}"
+        return f"Sent termination signal to {job_id}."
+
+
+class ListBgJobsTool(Tool):
+    """List all tracked background bash jobs."""
+    name = "ListBgJobs"
+    description = (
+        "List every tracked background bash job — running and completed — with id, "
+        "elapsed time, status, and the leading characters of the command."
+    )
+    parameters = {"type": "object", "properties": {}}
+
+    def execute(self, params):
+        now = time.time()
+        with _bg_tasks_lock:
+            snapshot = [
+                {
+                    "id": tid,
+                    "command": (e.get("command") or "")[:80],
+                    "status": ("running" if e.get("exit_code") is None
+                               else ("killed" if e.get("killed")
+                                     else f"exit {e.get('exit_code')}")),
+                    "elapsed_s": int(now - e.get("start", now)),
+                    "lines": len(e.get("lines") or []),
+                }
+                for tid, e in _bg_tasks.items()
+            ]
+        if not snapshot:
+            return "No background jobs."
+        snapshot.sort(key=lambda j: j["id"])
+        rows = [f"- {j['id']}: [{j['status']}, {j['elapsed_s']}s, "
+                f"{j['lines']} lines] {j['command']}" for j in snapshot]
+        return "\n".join(rows)
+
+
+def _consume_completed_bg_notifications():
+    """Return a list of newly-completed jobs and mark them notified.
+
+    Called at the start of each agent turn so the LLM is told about jobs that
+    finished while it was idle. Each entry is announced exactly once.
+    """
+    with _bg_tasks_lock:
+        completed = []
+        for tid, e in _bg_tasks.items():
+            if e.get("exit_code") is None:
+                continue
+            if e.get("notified"):
+                continue
+            completed.append({
+                "id": tid,
+                "command": (e.get("command") or "")[:80],
+                "exit_code": e.get("exit_code"),
+                "killed": bool(e.get("killed")),
+            })
+            e["notified"] = True
+        return completed
+
+
+def _shutdown_bg_jobs():
+    """Best-effort termination of all running bg jobs at process exit."""
+    with _bg_tasks_lock:
+        running = [(tid, e.get("proc")) for tid, e in _bg_tasks.items()
+                   if e.get("exit_code") is None and e.get("proc") is not None]
+    for tid, proc in running:
+        try:
+            if hasattr(os, "killpg") and platform.system() != "Windows":
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except (OSError, ProcessLookupError):
+                    pass
+            proc.terminate()
+        except Exception:
+            pass
+
+
+atexit.register(_shutdown_bg_jobs)
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".ico", ".tiff", ".tif"}
@@ -5583,7 +5839,8 @@ class ToolRegistry:
         for cls in [BashTool, ReadTool, WriteTool, EditTool, GlobTool,
                     GrepTool, WebFetchTool, WebSearchTool, NotebookEditTool,
                     TaskCreateTool, TaskListTool, TaskGetTool, TaskUpdateTool,
-                    AskUserQuestionTool]:
+                    AskUserQuestionTool,
+                    BashOutputTool, KillBashTool, ListBgJobsTool]:
             self.register(cls())
         return self
 
@@ -7377,6 +7634,21 @@ class Agent:
     def run(self, user_input):
         """Run the agent loop for a single user request."""
         _p = self.tui._scroll_print  # scroll-region-safe print
+
+        # Surface any background jobs that completed since last turn — exactly once.
+        completed_jobs = _consume_completed_bg_notifications()
+        if completed_jobs:
+            lines = []
+            for j in completed_jobs:
+                tag = "killed" if j["killed"] else f"exit {j['exit_code']}"
+                lines.append(f"  - {j['id']}: {tag} (command: {j['command']})")
+            note = (
+                "Background jobs finished since last turn:\n"
+                + "\n".join(lines)
+                + "\nUse BashOutput(job_id='bg_N') to read their output."
+            )
+            _p(f"\n  {_ansi(chr(27)+'[38;5;226m')}{note}{C.RESET}\n")
+            user_input = f"[system note]\n{note}\n[/system note]\n\n{user_input}"
 
         # Auto-parallel detection: if user asks multiple independent tasks, run them in parallel
         # Known limitation: RAG context is not injected when auto-parallel fires, because
