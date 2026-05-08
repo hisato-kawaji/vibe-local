@@ -11585,3 +11585,379 @@ class TestScenarioCrossFeatureSession:
         prompt = vc._build_system_prompt(cfg_next)
         assert "current_focus" in prompt
         assert "Building harness features" in prompt
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Cron — validation, plist rendering, and CronManager via mocked subprocess
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _FakeRunResult:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _make_recording_subprocess_run(returncode=0, stdout="", stderr=""):
+    """Returns (calls_list, run_fn). The run_fn records every invocation."""
+    calls = []
+    def _run(args, **kwargs):
+        calls.append({"args": list(args), "kwargs": dict(kwargs)})
+        return _FakeRunResult(returncode=returncode, stdout=stdout, stderr=stderr)
+    return calls, _run
+
+
+def _make_cron_config(tmp_path):
+    cfg = vc.Config()
+    cfg.config_dir = str(tmp_path / "cfg")
+    cfg.state_dir = str(tmp_path / "state")
+    cfg.sessions_dir = str(tmp_path / "state" / "sessions")
+    cfg.memory_dir = str(tmp_path / "cfg" / "memory")
+    os.makedirs(cfg.config_dir, mode=0o700, exist_ok=True)
+    return cfg
+
+
+class TestValidateCronExpression:
+    def test_accepts_simple(self):
+        parts, err = vc._validate_cron_expression("0 9 * * *")
+        assert err is None
+        assert parts == ["0", "9", "*", "*", "*"]
+
+    def test_accepts_step(self):
+        parts, err = vc._validate_cron_expression("*/5 * * * *")
+        assert err is None
+        assert parts[0] == "*/5"
+
+    def test_rejects_field_count(self):
+        for bad in ["", "0 9", "0 9 * * * *", "* * * *"]:
+            _parts, err = vc._validate_cron_expression(bad)
+            assert err is not None
+
+    def test_rejects_lists_and_ranges(self):
+        for bad in ["0,30 * * * *", "0 9-17 * * *", "0 9 * * 1-5", "1,2 * * * *"]:
+            _parts, err = vc._validate_cron_expression(bad)
+            assert err is not None
+            assert "not yet supported" in err or "unsupported" in err
+
+    def test_rejects_non_string(self):
+        _parts, err = vc._validate_cron_expression(None)
+        assert err is not None
+
+
+class TestCronToLaunchd:
+    def test_daily_at_time(self):
+        kind, value, err = vc._cron_to_launchd("30 14 * * *")
+        assert err is None
+        assert kind == "calendar"
+        assert value == {"Minute": 30, "Hour": 14}
+
+    def test_minute_interval(self):
+        kind, value, err = vc._cron_to_launchd("*/5 * * * *")
+        assert err is None
+        assert kind == "interval"
+        assert value == 300
+
+    def test_hour_interval(self):
+        kind, value, err = vc._cron_to_launchd("0 */2 * * *")
+        assert err is None
+        assert kind == "interval"
+        assert value == 2 * 3600
+
+    def test_specific_day_and_month(self):
+        kind, value, err = vc._cron_to_launchd("0 0 1 1 *")
+        assert err is None
+        assert kind == "calendar"
+        assert value == {"Minute": 0, "Hour": 0, "Day": 1, "Month": 1}
+
+    def test_all_stars_rejected(self):
+        kind, value, err = vc._cron_to_launchd("* * * * *")
+        assert err is not None  # too aggressive
+
+    def test_step_in_other_field_rejected(self):
+        kind, value, err = vc._cron_to_launchd("0 9 */2 * *")
+        assert err is not None
+
+
+class TestRenderLaunchdPlist:
+    def test_calendar_plist_wellformed(self):
+        plist = vc._render_launchd_plist(
+            "com.vibe-local.test",
+            "calendar", {"Minute": 0, "Hour": 9},
+            "/usr/bin/true",
+            "/tmp/log.txt",
+        )
+        assert "<key>Label</key>" in plist
+        assert "<string>com.vibe-local.test</string>" in plist
+        assert "<key>StartCalendarInterval</key>" in plist
+        assert "<key>Hour</key>" in plist
+        assert "<integer>9</integer>" in plist
+        assert "<key>StandardOutPath</key>" in plist
+        # XML escape
+        special = vc._render_launchd_plist(
+            "test", "interval", 60,
+            'echo "hi" & exit',
+            "/tmp/log.txt",
+        )
+        assert "&amp;" in special
+        assert "&quot;" in special
+
+    def test_interval_plist(self):
+        plist = vc._render_launchd_plist(
+            "com.vibe-local.bg",
+            "interval", 300,
+            "/usr/bin/true",
+            "/tmp/log.txt",
+        )
+        assert "<key>StartInterval</key>" in plist
+        assert "<integer>300</integer>" in plist
+        assert "StartCalendarInterval" not in plist
+
+
+class TestRenderCrontabLine:
+    def test_marker_present(self):
+        line = vc._render_crontab_line("*/5 * * * *", "/usr/bin/true", "vibe_abc")
+        assert line == "*/5 * * * * /usr/bin/true # vibe-local:vibe_abc"
+
+
+class TestCronManagerDarwin:
+    def setup_method(self):
+        # Force darwin path regardless of host
+        self._orig_platform = sys.platform
+
+    def _make_mgr(self, tmp_path, calls):
+        cfg = _make_cron_config(tmp_path)
+        mgr = vc.CronManager(
+            cfg,
+            subprocess_run=lambda args, **kw: (calls.append({"args": list(args),
+                                                              "kwargs": dict(kw)})
+                                                or _FakeRunResult()),
+            launch_agents_dir=str(tmp_path / "LaunchAgents"),
+        )
+        mgr.platform = "darwin"
+        return mgr, cfg
+
+    def test_create_writes_plist_and_ledger(self, tmp_path):
+        calls = []
+        mgr, cfg = self._make_mgr(tmp_path, calls)
+        cron_id, err = mgr.create("0 9 * * *", "review my PRs", name="dailyreview")
+        assert err is None
+        assert cron_id == "dailyreview"
+        plist_path = mgr._plist_path(cron_id)
+        assert os.path.isfile(plist_path)
+        plist_text = open(plist_path, encoding="utf-8").read()
+        assert "<key>Label</key>" in plist_text
+        assert "com.vibe-local.dailyreview" in plist_text
+        assert "<integer>9</integer>" in plist_text
+        # Ledger updated
+        ledger = mgr.list()
+        assert any(e["id"] == cron_id for e in ledger)
+        # subprocess invoked launchctl bootstrap
+        assert any("launchctl" in c["args"][0] and c["args"][1] == "bootstrap" for c in calls)
+
+    def test_create_rejects_duplicate(self, tmp_path):
+        calls = []
+        mgr, _cfg = self._make_mgr(tmp_path, calls)
+        cron_id, err = mgr.create("0 9 * * *", "x", name="job1")
+        assert err is None
+        cron_id2, err2 = mgr.create("0 10 * * *", "x", name="job1")
+        assert cron_id2 is None
+        assert "already exists" in err2
+
+    def test_create_rejects_bad_name(self, tmp_path):
+        calls = []
+        mgr, _ = self._make_mgr(tmp_path, calls)
+        for bad in ["job 1", "../job", "name.dot", "name/slash"]:
+            cid, err = mgr.create("0 9 * * *", "x", name=bad)
+            assert cid is None
+            assert err is not None
+
+    def test_create_rejects_bad_schedule(self, tmp_path):
+        calls = []
+        mgr, _ = self._make_mgr(tmp_path, calls)
+        cid, err = mgr.create("not-a-cron-expression", "x")
+        assert cid is None
+        assert "5 space-separated fields" in err
+
+    def test_delete_removes_plist_and_ledger_entry(self, tmp_path):
+        calls = []
+        mgr, _ = self._make_mgr(tmp_path, calls)
+        cron_id, _ = mgr.create("0 9 * * *", "x", name="byejob")
+        assert os.path.isfile(mgr._plist_path(cron_id))
+        ok, _err = mgr.delete(cron_id)
+        assert ok is True
+        assert not os.path.isfile(mgr._plist_path(cron_id))
+        assert not any(e["id"] == cron_id for e in mgr.list())
+        # bootout was attempted
+        assert any(c["args"][0] == "launchctl" and c["args"][1] == "bootout"
+                   for c in calls)
+
+    def test_delete_unknown_id(self, tmp_path):
+        calls = []
+        mgr, _ = self._make_mgr(tmp_path, calls)
+        ok, err = mgr.delete("nope")
+        assert ok is False
+        assert "not found" in err
+
+    def test_list_empty(self, tmp_path):
+        calls = []
+        mgr, _ = self._make_mgr(tmp_path, calls)
+        assert mgr.list() == []
+
+
+class TestCronManagerLinux:
+    def _make_mgr(self, tmp_path, *, crontab_l_returncode=0,
+                  crontab_l_stdout="", crontab_w_returncode=0):
+        cfg = _make_cron_config(tmp_path)
+        captured = {"writes": []}
+
+        def _run(args, **kw):
+            if args[:2] == ["crontab", "-l"]:
+                return _FakeRunResult(returncode=crontab_l_returncode,
+                                      stdout=crontab_l_stdout)
+            if args[:2] == ["crontab", "-"]:
+                captured["writes"].append(kw.get("input", ""))
+                return _FakeRunResult(returncode=crontab_w_returncode, stderr="")
+            return _FakeRunResult()
+
+        mgr = vc.CronManager(cfg, subprocess_run=_run)
+        mgr.platform = "linux"
+        return mgr, captured
+
+    def test_create_appends_crontab_line(self, tmp_path):
+        mgr, captured = self._make_mgr(tmp_path)
+        cron_id, err = mgr.create("*/15 * * * *", "ping", name="lintab")
+        assert err is None
+        assert cron_id == "lintab"
+        assert any("# vibe-local:lintab" in w for w in captured["writes"])
+        assert any("*/15 * * * *" in w for w in captured["writes"])
+
+    def test_delete_filters_marker_line(self, tmp_path):
+        # First install one with empty crontab, then delete with crontab containing it
+        mgr, captured = self._make_mgr(tmp_path)
+        cron_id, _ = mgr.create("0 9 * * *", "x", name="rmlin")
+        # Snapshot the line that was written
+        installed_line = captured["writes"][-1].splitlines()[-1]
+        # Now create a fresh manager whose crontab "currently contains" that line
+        mgr2, captured2 = self._make_mgr(
+            tmp_path,
+            crontab_l_stdout=installed_line + "\nother line\n",
+        )
+        # ledger was persisted by first manager already → reuse same config_dir
+        ok, err = mgr2.delete(cron_id)
+        assert ok is True
+        # The new crontab content shouldn't contain the marker anymore
+        new_content = captured2["writes"][-1]
+        assert f"# vibe-local:{cron_id}" not in new_content
+        assert "other line" in new_content
+
+
+class TestCronTools:
+    def test_create_tool_happy_path(self, tmp_path):
+        cfg = _make_cron_config(tmp_path)
+        # Patch CronManager via monkeypatching subprocess globally
+        with mock.patch.object(vc.subprocess, "run",
+                               return_value=_FakeRunResult(returncode=0)):
+            with mock.patch.object(vc.CronManager, "_install_launchd",
+                                    return_value=None) as install:
+                with mock.patch.object(vc.os.path, "expanduser",
+                                       wraps=os.path.expanduser):
+                    if sys.platform == "darwin":
+                        out = vc.CronCreateTool(cfg).execute({
+                            "schedule": "0 9 * * *",
+                            "prompt": "summarize my PRs",
+                            "name": "demo",
+                        })
+                        assert "Scheduled cron 'demo'" in out
+                        assert install.called
+
+    def test_create_tool_rejects_bad_schedule(self, tmp_path):
+        cfg = _make_cron_config(tmp_path)
+        out = vc.CronCreateTool(cfg).execute({
+            "schedule": "garbage", "prompt": "x",
+        })
+        assert out.startswith("Error:")
+
+    def test_list_tool_empty(self, tmp_path):
+        cfg = _make_cron_config(tmp_path)
+        out = vc.CronListTool(cfg).execute({})
+        assert "No scheduled cron entries" in out
+
+    def test_list_tool_renders_entries(self, tmp_path):
+        cfg = _make_cron_config(tmp_path)
+        ledger_path = os.path.join(cfg.config_dir, "crons.json")
+        with open(ledger_path, "w", encoding="utf-8") as f:
+            json.dump([{
+                "id": "demo",
+                "schedule": "0 9 * * *",
+                "prompt": "review PRs",
+                "platform": "darwin",
+                "log_path": "/tmp/x.log",
+                "created_at": "2026-05-08T01:00:00Z",
+            }], f)
+        out = vc.CronListTool(cfg).execute({})
+        assert "demo" in out
+        assert "0 9 * * *" in out
+        assert "review PRs" in out
+
+    def test_delete_tool_unknown(self, tmp_path):
+        cfg = _make_cron_config(tmp_path)
+        out = vc.CronDeleteTool(cfg).execute({"id": "ghost"})
+        assert out.startswith("Error:")
+
+    def test_delete_tool_missing_id(self, tmp_path):
+        cfg = _make_cron_config(tmp_path)
+        out = vc.CronDeleteTool(cfg).execute({})
+        assert out.startswith("Error:")
+
+
+# ─── Scenario: full cron lifecycle on simulated darwin ──────────────────────
+
+class TestScenarioCronLifecycle:
+    def test_create_list_delete_roundtrip(self, tmp_path):
+        cfg = _make_cron_config(tmp_path)
+        calls = []
+        mgr = vc.CronManager(
+            cfg,
+            subprocess_run=lambda args, **kw: (
+                calls.append({"args": list(args)}) or _FakeRunResult()),
+            launch_agents_dir=str(tmp_path / "LaunchAgents"),
+        )
+        mgr.platform = "darwin"
+
+        # --- 1) Schedule a daily 9am job ---
+        cron_id_1, err = mgr.create("0 9 * * *", "summarize my PRs", name="daily9")
+        assert err is None
+        assert cron_id_1 == "daily9"
+        # plist exists on disk
+        plist_path = mgr._plist_path(cron_id_1)
+        assert os.path.isfile(plist_path)
+        # launchctl bootstrap was attempted
+        assert any(c["args"][:2] == ["launchctl", "bootstrap"] for c in calls)
+
+        # --- 2) Schedule a 5-minute interval job ---
+        cron_id_2, err = mgr.create("*/5 * * * *", "ping status", name="every5")
+        assert err is None
+        plist2 = open(mgr._plist_path(cron_id_2), encoding="utf-8").read()
+        # interval-mode plist uses StartInterval, not calendar
+        assert "<key>StartInterval</key>" in plist2
+        assert "<integer>300</integer>" in plist2
+
+        # --- 3) List both via the user-facing tool ---
+        list_out = vc.CronListTool(cfg).execute({})
+        assert "daily9" in list_out
+        assert "every5" in list_out
+        assert "0 9 * * *" in list_out
+
+        # --- 4) Delete one — ledger and plist both updated ---
+        ok, err = mgr.delete("daily9")
+        assert ok is True
+        assert not os.path.isfile(mgr._plist_path("daily9"))
+        # bootout attempted
+        assert any(c["args"][:2] == ["launchctl", "bootout"] for c in calls)
+        # The other one survives
+        remaining = mgr.list()
+        assert len(remaining) == 1
+        assert remaining[0]["id"] == "every5"
+        # Ledger persisted across new manager instances
+        mgr_fresh = vc.CronManager(cfg)
+        assert any(e["id"] == "every5" for e in mgr_fresh.list())
