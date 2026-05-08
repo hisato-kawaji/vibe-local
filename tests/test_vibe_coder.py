@@ -11246,3 +11246,342 @@ class TestBgShutdown:
                     timeout=5.0)
         with vc._bg_tasks_lock:
             assert vc._bg_tasks[tid]["exit_code"] is not None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Scenario tests — multi-feature workflows mirroring real usage patterns
+#
+# Each scenario chains the actual production code paths the way a vibe-local
+# session does, but without any LLM round-trips. They are unit-test fast yet
+# catch the kind of integration regressions a single-component test misses.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _make_scenario_config(tmp_path):
+    """Build a Config rooted in tmp_path so memory/settings/cwd are isolated."""
+    cfg = vc.Config()
+    cfg.config_dir = str(tmp_path / "cfg")
+    cfg.state_dir = str(tmp_path / "state")
+    cfg.sessions_dir = str(tmp_path / "state" / "sessions")
+    cfg.memory_dir = str(tmp_path / "cfg" / "memory")
+    # Keep the Project Instructions walk silent — point cwd at an empty dir
+    cwd_dir = tmp_path / "workspace"
+    cwd_dir.mkdir(parents=True, exist_ok=True)
+    cfg.cwd = str(cwd_dir)
+    for d in (cfg.config_dir, cfg.memory_dir, cfg.state_dir, cfg.sessions_dir):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    return cfg
+
+
+def _run_tool_through_agent_hooks(tool, params, hooks):
+    """Faithful mini-replica of Agent's sequential tool-exec path w/ hooks.
+
+    Mirrors vibe-coder.py's Agent.run sequential branch: PreToolUse can block,
+    PostToolUse output gets appended to the tool result.
+    Returns (output, is_blocked).
+    """
+    if hooks and hooks.has_hooks("PreToolUse"):
+        allow, reason = hooks.run("PreToolUse",
+                                  {"tool_name": tool.name, "tool_input": params})
+        if not allow:
+            return f"Blocked by PreToolUse hook: {reason}", True
+    output = tool.execute(params)
+    if hooks and hooks.has_hooks("PostToolUse"):
+        preview = output if isinstance(output, str) else str(output)
+        _, hook_out = hooks.run("PostToolUse",
+                                {"tool_name": tool.name, "tool_input": params,
+                                 "tool_result": preview[:2000]})
+        if hook_out and isinstance(output, str):
+            output = f"{output}\n\n[PostToolUse hook output]\n{hook_out}"
+    return output, False
+
+
+class TestScenarioMemoryAcrossSessions:
+    """Scenario: user saves memories in one session and they reappear in the next."""
+
+    def test_memories_survive_simulated_restart(self, tmp_path):
+        # --- Session 1: save two memories ---
+        cfg1 = _make_scenario_config(tmp_path)
+        vc.MemoryWriteTool(cfg1).execute({
+            "name": "user_role",
+            "type": "user",
+            "description": "Backend engineer using local LLMs",
+            "content": "Prefers terse responses; deep Go expertise.",
+        })
+        vc.MemoryWriteTool(cfg1).execute({
+            "name": "team_deadline",
+            "type": "project",
+            "description": "v0.4 ships 2026-06-30",
+            "content": "Five harness features must land before that.",
+        })
+        # The user-role memory must show up in *this* session's prompt too
+        prompt1 = vc._build_system_prompt(cfg1)
+        assert "# Memory" in prompt1
+        assert "user_role" in prompt1
+        assert "team_deadline" in prompt1
+
+        # --- Session 2: brand-new Config but same on-disk dir ---
+        # This mimics quitting vibe-local and starting it again.
+        cfg2 = _make_scenario_config(tmp_path)
+        prompt2 = vc._build_system_prompt(cfg2)
+        assert "# Memory" in prompt2
+        assert "Backend engineer using local LLMs" in prompt2
+        assert "v0.4 ships 2026-06-30" in prompt2
+
+        # --- Session 2 deletes one memory; session 3 sees only the other ---
+        vc.MemoryDeleteTool(cfg2).execute({"name": "team_deadline"})
+        cfg3 = _make_scenario_config(tmp_path)
+        prompt3 = vc._build_system_prompt(cfg3)
+        assert "user_role" in prompt3
+        assert "team_deadline" not in prompt3
+
+
+class TestScenarioHooksDynamicReload:
+    """Scenario: settings.json change between turns flips hook behavior."""
+
+    def test_block_then_allow_via_settings_reload(self, tmp_path):
+        cfg = _make_scenario_config(tmp_path)
+        settings_path = os.path.join(cfg.config_dir, "settings.json")
+        bash = vc.BashTool()
+
+        # --- Turn 1: block all Bash via PreToolUse exit 1 ---
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "hooks": {"PreToolUse": [
+                    {"matcher": "Bash",
+                     "hooks": [{"command": "echo blocked_by_audit >&2; exit 1"}]}
+                ]}
+            }, f)
+        hm_v1 = vc.HooksManager(cfg)
+        out1, blocked1 = _run_tool_through_agent_hooks(
+            bash, {"command": "echo should_not_run"}, hm_v1)
+        assert blocked1 is True
+        assert "blocked_by_audit" in out1
+        assert "should_not_run" not in out1
+
+        # --- Turn 2: settings flipped to allow + add PostToolUse logger ---
+        log_path = tmp_path / "post.log"
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "hooks": {
+                    "PreToolUse": [
+                        {"matcher": "Bash",
+                         "hooks": [{"command": "true"}]}
+                    ],
+                    "PostToolUse": [
+                        {"matcher": "Bash",
+                         "hooks": [{"command": f"echo audited >> {log_path}"}]}
+                    ],
+                }
+            }, f)
+        hm_v2 = vc.HooksManager(cfg)
+        out2, blocked2 = _run_tool_through_agent_hooks(
+            bash, {"command": "echo allowed_run"}, hm_v2)
+        assert blocked2 is False
+        assert "allowed_run" in out2
+        # PostToolUse fired and its log file got a line
+        assert log_path.exists()
+        assert "audited" in log_path.read_text(encoding="utf-8")
+
+
+class TestScenarioDeferredDiscovery:
+    """Scenario: deferred MCP-style tool is discovered → searched → promoted → invoked."""
+
+    def test_full_discovery_chain(self):
+        # Imagine: an MCP Sentry server alongside an unrelated MCP Slack server.
+        # We want the keyword query to surface only the Sentry one.
+        registry = vc.ToolRegistry().register_defaults()
+        registry.register(_StubTool(
+            "mcp__sentry__search_issues",
+            description="Search Sentry for unresolved issues by query string.",
+            deferred=True,
+        ))
+        registry.register(_StubTool(
+            "mcp__slack__post_message",
+            description="Send a message to a Slack channel.",
+            deferred=True,
+        ))
+        registry.register(vc.ToolSearchTool(registry))
+
+        # --- Step 1: deferred tools NOT in the LLM-visible schemas ---
+        eager_names = {s["function"]["name"] for s in registry.get_schemas()}
+        assert "ToolSearch" in eager_names
+        assert "mcp__sentry__search_issues" not in eager_names
+        assert "mcp__slack__post_message" not in eager_names
+
+        # --- Step 2: deferred-tools block is in the system prompt ---
+        # We simulate the main() injection by calling the same function:
+        block = vc._build_deferred_tools_block(registry)
+        assert "mcp__sentry__search_issues" in block
+        assert "mcp__slack__post_message" in block
+        assert "Search Sentry for unresolved issues" in block
+
+        # --- Step 3: keyword query promotes only the matching Sentry tool ---
+        ts = registry.get("ToolSearch")
+        result = ts.execute({"query": "sentry issues"})
+        assert "mcp__sentry__search_issues" in result
+        assert "mcp__slack__post_message" not in result
+
+        # --- Step 4: now the Sentry tool is eager and callable ---
+        eager_after = {s["function"]["name"] for s in registry.get_schemas()}
+        assert "mcp__sentry__search_issues" in eager_after
+        assert registry.is_deferred("mcp__slack__post_message") is True
+        # And we can actually call the promoted tool
+        out = registry.get("mcp__sentry__search_issues").execute({})
+        assert out == "ran mcp__sentry__search_issues"
+
+        # --- Step 5: select: form pulls the second one in too ---
+        result2 = ts.execute({"query": "select:mcp__slack__post_message"})
+        assert "mcp__slack__post_message" in result2
+        assert registry.is_deferred("mcp__slack__post_message") is False
+
+
+class TestScenarioBackgroundJobLifecycle:
+    """Scenario: long-running bg command observed via streaming, killed, notified."""
+
+    def setup_method(self):
+        _clear_bg_tasks()
+
+    def teardown_method(self):
+        _clear_bg_tasks()
+
+    def test_spawn_poll_kill_and_announce(self):
+        bash = vc.BashTool()
+        # Spawn: 30s sleep prints lines slowly so streaming is observable
+        spawn_msg = bash.execute({
+            "command": "for i in 1 2 3 4 5 6 7 8; do echo line$i; sleep 0.05; done; sleep 30",
+            "run_in_background": True,
+        })
+        m = re.search(r'(bg_\d+)', spawn_msg)
+        assert m, spawn_msg
+        tid = m.group(1)
+
+        # Initial poll: wait until at least one line shows up
+        first_out = _wait_until(
+            lambda: vc.BashOutputTool().execute({"job_id": tid})
+                    if "line1" in vc.BashOutputTool().execute({"job_id": tid}) else None,
+            timeout=3.0)
+        assert first_out and "line1" in first_out
+        # ListBgJobs should mention this id while still running
+        listing = vc.ListBgJobsTool().execute({})
+        assert tid in listing
+        assert "running" in listing
+
+        # Snapshot how many lines we already saw, then since_line skips them
+        with vc._bg_tasks_lock:
+            seen = len(vc._bg_tasks[tid]["lines"])
+        # Wait for a few more lines to accumulate
+        _wait_until(lambda: len(vc._bg_tasks.get(tid, {}).get("lines", [])) > seen + 1,
+                    timeout=2.0)
+        out_skip = vc.BashOutputTool().execute(
+            {"job_id": tid, "since_line": seen})
+        assert "line1" not in out_skip   # already seen, should be skipped
+        # ... but at least one of the later lines should be visible
+        assert any(f"line{i}" in out_skip for i in range(2, 9))
+
+        # Kill the job — completes via SIGTERM (then SIGKILL) and reaper records it
+        kill_msg = vc.KillBashTool().execute({"job_id": tid})
+        assert "Sent" in kill_msg or "termination" in kill_msg.lower()
+        _wait_until(lambda: vc._bg_tasks.get(tid, {}).get("exit_code") is not None,
+                    timeout=5.0)
+
+        # The completion notification fires exactly once and is flagged killed=True
+        notes_first = vc._consume_completed_bg_notifications()
+        match = next((n for n in notes_first if n["id"] == tid), None)
+        assert match is not None
+        assert match["killed"] is True
+        # A second consume must NOT re-announce the same job
+        notes_second = vc._consume_completed_bg_notifications()
+        assert all(n["id"] != tid for n in notes_second)
+
+        # ListBgJobs now shows it as killed
+        final_listing = vc.ListBgJobsTool().execute({})
+        assert tid in final_listing
+        assert "killed" in final_listing
+
+
+class TestScenarioCrossFeatureSession:
+    """Scenario: a single 'session' uses memory + hooks + deferred + bg together."""
+
+    def setup_method(self):
+        _clear_bg_tasks()
+
+    def teardown_method(self):
+        _clear_bg_tasks()
+
+    def test_full_session_walkthrough(self, tmp_path):
+        cfg = _make_scenario_config(tmp_path)
+
+        # --- Configure PostToolUse to log every MemoryWrite to a file ---
+        log_path = tmp_path / "memwrite.log"
+        settings_path = os.path.join(cfg.config_dir, "settings.json")
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "hooks": {
+                    "PostToolUse": [
+                        # First command logs to file (stdout swallowed by redirect),
+                        # second command emits to stdout so HookManager captures it.
+                        {"matcher": "MemoryWrite",
+                         "hooks": [{"command": f"echo memwrite_fired >> {log_path}; "
+                                                f"echo audit_ack"}]}
+                    ],
+                }
+            }, f)
+        hooks = vc.HooksManager(cfg)
+
+        # --- 1) MemoryWrite via the agent path → triggers PostToolUse hook ---
+        mwrite = vc.MemoryWriteTool(cfg)
+        out, blocked = _run_tool_through_agent_hooks(
+            mwrite,
+            {"name": "current_focus", "type": "project",
+             "description": "Building harness features",
+             "content": "Issues #1-#5 are the v0.4 scope."},
+            hooks,
+        )
+        assert blocked is False
+        assert "Saved memory 'current_focus'" in out
+        # Hook stdout was appended to the agent-visible result
+        assert "audit_ack" in out
+        # And the side-effect log file got the line as well
+        assert log_path.exists()
+        assert "memwrite_fired" in log_path.read_text(encoding="utf-8")
+
+        # --- 2) Set up deferred tools and discover one ---
+        registry = vc.ToolRegistry().register_defaults()
+        registry.register(_StubTool(
+            "mcp__github__create_pr",
+            description="Open a pull request with title and branch.",
+            deferred=True,
+        ))
+        registry.register(vc.ToolSearchTool(registry))
+        # Initially deferred → not in schemas
+        assert "mcp__github__create_pr" not in {
+            s["function"]["name"] for s in registry.get_schemas()
+        }
+        # Discover it
+        result = registry.get("ToolSearch").execute(
+            {"query": "select:mcp__github__create_pr"})
+        assert "mcp__github__create_pr" in result
+        # Now eager
+        assert "mcp__github__create_pr" in {
+            s["function"]["name"] for s in registry.get_schemas()
+        }
+
+        # --- 3) Kick off a bg job and confirm it shows up + completes ---
+        bash = vc.BashTool()
+        spawn_msg = bash.execute({
+            "command": "echo bg_step_done", "run_in_background": True,
+        })
+        tid = re.search(r'(bg_\d+)', spawn_msg).group(1)
+        _wait_until(lambda: vc._bg_tasks.get(tid, {}).get("exit_code") is not None,
+                    timeout=5.0)
+
+        # --- 4) Simulate the start of the next agent turn ---
+        # _consume_completed_bg_notifications mirrors what Agent.run does.
+        notes = vc._consume_completed_bg_notifications()
+        assert any(n["id"] == tid and n["killed"] is False for n in notes)
+
+        # --- 5) Restart simulation — fresh Config picks up the memory ---
+        cfg_next = _make_scenario_config(tmp_path)
+        prompt = vc._build_system_prompt(cfg_next)
+        assert "current_focus" in prompt
+        assert "Building harness features" in prompt
