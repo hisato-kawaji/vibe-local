@@ -2195,6 +2195,7 @@ class Tool(ABC):
     name = ""
     description = ""
     parameters = {}  # JSON Schema
+    deferred = False  # When True, schema is omitted from the LLM tool list until ToolSearch promotes it.
 
     @abstractmethod
     def execute(self, params):
@@ -4312,6 +4313,166 @@ class MemoryListTool(Tool):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# ToolSearch — On-demand schema loading for deferred tools
+# ════════════════════════════════════════════════════════════════════════════════
+
+TOOL_SEARCH_DEFAULT_LIMIT = 5
+TOOL_SEARCH_MAX_LIMIT = 20
+
+
+def _build_deferred_tools_block(registry):
+    """Render the system-prompt section that lists deferred tools by name + description."""
+    pairs = registry.list_deferred()
+    if not pairs:
+        return ""
+    lines = [
+        "\n# Deferred Tools",
+        "",
+        "These tools are available but their full schemas are NOT loaded by default. "
+        "Use `ToolSearch(query=\"select:NAME1,NAME2\")` to load specific tools by name, or "
+        "`ToolSearch(query=\"keyword another_word\")` to search by name/description. "
+        "After ToolSearch returns, the listed tools become callable on subsequent turns.",
+        "",
+    ]
+    for name, desc in sorted(pairs):
+        first_line = (desc or "").splitlines()[0] if desc else ""
+        lines.append(f"- {name}: {first_line[:200]}")
+    return "\n".join(lines) + "\n"
+
+
+class ToolSearchTool(Tool):
+    """Look up deferred-tool schemas on demand and promote them to eager."""
+    name = "ToolSearch"
+    description = (
+        "Look up the full JSON schema of one or more deferred tools so they can be "
+        "called. Query forms: `select:NAME1,NAME2` (load these names exactly), "
+        "`+keyword other_term` (require the first term, rank by the rest), or "
+        "plain `keyword keyword2` (keyword search across name and description). "
+        "Returns each matched tool's complete schema; matched tools become callable "
+        "on subsequent turns of this session."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search query — see tool description for accepted forms.",
+            },
+            "max_results": {
+                "type": "number",
+                "description": (
+                    f"Maximum number of tools to return for keyword queries "
+                    f"(default {TOOL_SEARCH_DEFAULT_LIMIT}, max {TOOL_SEARCH_MAX_LIMIT})."
+                ),
+            },
+        },
+        "required": ["query"],
+    }
+
+    def __init__(self, registry):
+        self.registry = registry
+
+    @staticmethod
+    def _score(name, description, terms):
+        """Higher score = better match. Name matches outweigh description matches."""
+        haystack_name = (name or "").lower()
+        haystack_desc = (description or "").lower()
+        score = 0
+        for term in terms:
+            t = term.lower()
+            if not t:
+                continue
+            if t in haystack_name:
+                score += 5
+                if haystack_name.startswith(t):
+                    score += 2
+            if t in haystack_desc:
+                score += 1
+        return score
+
+    def execute(self, params):
+        query = (params.get("query") or "").strip()
+        if not query:
+            return "Error: query is required"
+        try:
+            limit = int(params.get("max_results", TOOL_SEARCH_DEFAULT_LIMIT))
+        except (TypeError, ValueError):
+            limit = TOOL_SEARCH_DEFAULT_LIMIT
+        limit = max(1, min(limit, TOOL_SEARCH_MAX_LIMIT))
+
+        deferred_pairs = self.registry.list_deferred()
+        if not deferred_pairs:
+            return "No deferred tools available."
+
+        # Direct selection: select:foo,bar,baz
+        if query.startswith("select:"):
+            wanted = [n.strip() for n in query[len("select:"):].split(",") if n.strip()]
+            matched = []
+            missing = []
+            for name in wanted:
+                tool = self.registry.get(name)
+                if tool is None or not self.registry.is_deferred(name):
+                    missing.append(name)
+                    continue
+                matched.append(tool)
+            promoted = [t.name for t in matched]
+            for t in matched:
+                self.registry.promote(t.name)
+            return self._format_result(matched, missing=missing, promoted=promoted)
+
+        # Required (+) and optional terms
+        raw_terms = [t for t in re.split(r"\s+", query) if t]
+        required = [t[1:] for t in raw_terms if t.startswith("+") and len(t) > 1]
+        terms = [t for t in raw_terms if not t.startswith("+")] + required
+
+        scored = []
+        for name, desc in deferred_pairs:
+            haystack = f"{name} {desc or ''}".lower()
+            if any(req.lower() not in haystack for req in required):
+                continue
+            score = self._score(name, desc, terms)
+            if score > 0:
+                scored.append((score, name))
+
+        scored.sort(key=lambda pair: (-pair[0], pair[1]))
+        selected = []
+        for _score, name in scored[:limit]:
+            tool = self.registry.get(name)
+            if tool is None:
+                continue
+            selected.append(tool)
+        promoted = [t.name for t in selected]
+        for t in selected:
+            self.registry.promote(t.name)
+
+        if not selected:
+            return f"No deferred tools matched query: {query!r}"
+        return self._format_result(selected, missing=[], promoted=promoted)
+
+    @staticmethod
+    def _format_result(tools, missing, promoted):
+        parts = []
+        if promoted:
+            parts.append(
+                f"Loaded {len(promoted)} tool(s); they are now callable: "
+                f"{', '.join(promoted)}."
+            )
+        if missing:
+            parts.append(
+                f"Skipped {len(missing)} unknown or already-loaded name(s): "
+                f"{', '.join(missing)}."
+            )
+        for tool in tools:
+            schema = tool.get_schema()
+            try:
+                rendered = json.dumps(schema, ensure_ascii=False, indent=2)
+            except (TypeError, ValueError):
+                rendered = repr(schema)
+            parts.append(f"\n--- {tool.name} ---\n{rendered}")
+        return "\n".join(parts)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Hooks — Event-driven shell commands loaded from settings.json
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -5357,24 +5518,63 @@ class ParallelAgentTool(Tool):
 # ════════════════════════════════════════════════════════════════════════════════
 
 class ToolRegistry:
-    """Manages all available tools and provides schemas for function calling."""
+    """Manages tools and provides schemas for function calling.
+
+    Eager tools have their schemas exposed to the LLM on every request.
+    Deferred tools are kept in a separate map; their *names* are surfaced
+    via the system prompt but their full schemas are only sent to the
+    LLM after ToolSearch promotes them. This keeps the prompt small when
+    many MCP tools are connected.
+    """
 
     def __init__(self):
-        self._tools = {}
+        self._tools = {}        # eager tools — schema sent to LLM
+        self._deferred = {}     # deferred tools — schema withheld until promotion
+        self._cached_schemas = None
 
-    def register(self, tool):
-        self._tools[tool.name] = tool
+    def register(self, tool, deferred=None):
+        """Register a tool. If `deferred` is None, falls back to tool.deferred."""
+        is_deferred = bool(getattr(tool, "deferred", False) if deferred is None else deferred)
+        # Remove from the other bucket if it was already registered there
+        self._tools.pop(tool.name, None)
+        self._deferred.pop(tool.name, None)
+        if is_deferred:
+            self._deferred[tool.name] = tool
+        else:
+            self._tools[tool.name] = tool
         self._cached_schemas = None  # invalidate cache on new registration
 
+    def promote(self, name):
+        """Move a deferred tool to the eager bucket. Returns True on success."""
+        tool = self._deferred.pop(name, None)
+        if tool is None:
+            return False
+        self._tools[name] = tool
+        self._cached_schemas = None
+        return True
+
+    def is_deferred(self, name):
+        return name in self._deferred
+
+    def list_deferred(self):
+        """Return list of (name, description) for all deferred tools."""
+        return [(t.name, t.description) for t in self._deferred.values()]
+
     def get(self, name):
-        return self._tools.get(name)
+        """Look up a tool by name in both eager and deferred maps."""
+        return self._tools.get(name) or self._deferred.get(name)
 
     def names(self):
+        """Names of eager tools only (those whose schemas are sent to the LLM)."""
         return list(self._tools.keys())
 
+    def all_names(self):
+        """Names of every registered tool, eager and deferred."""
+        return list(self._tools.keys()) + list(self._deferred.keys())
+
     def get_schemas(self):
-        """Return list of OpenAI function calling schemas (cached after first call)."""
-        if not hasattr(self, '_cached_schemas') or self._cached_schemas is None:
+        """Return OpenAI function calling schemas for eager tools only (cached)."""
+        if self._cached_schemas is None:
             self._cached_schemas = [t.get_schema() for t in self._tools.values()]
         return self._cached_schemas
 
@@ -7943,11 +8143,13 @@ def main():
     registry.register(MemoryUpdateTool(config))
     registry.register(MemoryDeleteTool(config))
     registry.register(MemoryListTool(config))
+    registry.register(ToolSearchTool(registry))
     registry.register(SubAgentTool(config, client, registry, permissions))
     coordinator = MultiAgentCoordinator(config, client, registry, permissions)
     registry.register(ParallelAgentTool(coordinator))
 
-    # Initialize MCP servers
+    # Initialize MCP servers — register MCP tools as deferred so the LLM
+    # discovers them via ToolSearch instead of bloating every request.
     _mcp_clients = []
     mcp_server_configs = _load_mcp_servers(config)
     for srv_name, srv_config in mcp_server_configs.items():
@@ -7963,14 +8165,20 @@ def main():
             tools = mcp.list_tools()
             for tool_schema in tools:
                 mcp_tool = MCPTool(mcp, tool_schema)
-                registry.register(mcp_tool)
+                registry.register(mcp_tool, deferred=True)
                 # MCP tools need permission checks
                 permissions.ASK_TOOLS.add(mcp_tool.name)
             _mcp_clients.append(mcp)
             if config.debug:
-                print(f"{C.DIM}[debug] MCP '{srv_name}': {len(tools)} tools registered{C.RESET}", file=sys.stderr)
+                print(f"{C.DIM}[debug] MCP '{srv_name}': {len(tools)} tools registered (deferred){C.RESET}", file=sys.stderr)
         except Exception as e:
             print(f"{C.YELLOW}Warning: MCP server '{srv_name}' failed: {e}{C.RESET}", file=sys.stderr)
+
+    # Append the deferred-tools catalog to the system prompt so the LLM knows
+    # what is reachable via ToolSearch.
+    _deferred_block = _build_deferred_tools_block(registry)
+    if _deferred_block:
+        session.system_prompt += _deferred_block
 
     hooks = HooksManager(config)
     agent = Agent(config, client, registry, permissions, session, tui,

@@ -10795,3 +10795,237 @@ class TestAgentAcceptsHooks:
         agent = vc.Agent(cfg, client, registry, permissions, session, tui,
                          rag_engine=None, hooks=hm)
         assert agent.hooks is hm
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Deferred tools — schemas hidden until ToolSearch promotes them
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _StubTool(vc.Tool):
+    """Minimal concrete Tool used for registry tests."""
+    def __init__(self, name, description="stub", deferred=False):
+        self.name = name
+        self.description = description
+        self.deferred = deferred
+        self.parameters = {"type": "object", "properties": {}}
+
+    def execute(self, params):
+        return f"ran {self.name}"
+
+
+class TestToolDeferredAttribute:
+
+    def test_default_is_eager(self):
+        assert vc.Tool.deferred is False
+
+    def test_subclass_can_set_deferred(self):
+        t = _StubTool("X", deferred=True)
+        assert t.deferred is True
+
+
+class TestRegistryDeferred:
+
+    def test_register_uses_tool_attribute(self):
+        reg = vc.ToolRegistry()
+        eager = _StubTool("Eager", deferred=False)
+        defer = _StubTool("Defer", deferred=True)
+        reg.register(eager)
+        reg.register(defer)
+        assert "Eager" in reg.names()
+        assert "Defer" not in reg.names()
+        assert reg.is_deferred("Defer") is True
+        assert reg.is_deferred("Eager") is False
+
+    def test_register_kwarg_overrides_attribute(self):
+        reg = vc.ToolRegistry()
+        always_deferred = _StubTool("D", deferred=True)
+        reg.register(always_deferred, deferred=False)  # force eager
+        assert "D" in reg.names()
+        assert reg.is_deferred("D") is False
+
+    def test_get_finds_deferred_tools(self):
+        reg = vc.ToolRegistry()
+        t = _StubTool("Hidden", deferred=True)
+        reg.register(t)
+        assert reg.get("Hidden") is t
+
+    def test_schemas_exclude_deferred(self):
+        reg = vc.ToolRegistry()
+        reg.register(_StubTool("Visible", deferred=False))
+        reg.register(_StubTool("Hidden", deferred=True))
+        names = [s["function"]["name"] for s in reg.get_schemas()]
+        assert "Visible" in names
+        assert "Hidden" not in names
+
+    def test_promote_moves_to_eager(self):
+        reg = vc.ToolRegistry()
+        reg.register(_StubTool("Hidden", deferred=True))
+        # schemas snapshot before
+        before = [s["function"]["name"] for s in reg.get_schemas()]
+        assert "Hidden" not in before
+        ok = reg.promote("Hidden")
+        assert ok is True
+        after = [s["function"]["name"] for s in reg.get_schemas()]
+        assert "Hidden" in after  # cache invalidated, schema now present
+        assert reg.is_deferred("Hidden") is False
+
+    def test_promote_unknown_returns_false(self):
+        reg = vc.ToolRegistry()
+        assert reg.promote("ghost") is False
+
+    def test_re_register_moves_between_buckets(self):
+        reg = vc.ToolRegistry()
+        t = _StubTool("Switch", deferred=False)
+        reg.register(t)
+        reg.register(t, deferred=True)  # downgrade
+        assert reg.is_deferred("Switch") is True
+        assert "Switch" not in reg.names()
+        reg.register(t, deferred=False)  # upgrade back
+        assert "Switch" in reg.names()
+        assert reg.is_deferred("Switch") is False
+
+    def test_list_deferred(self):
+        reg = vc.ToolRegistry()
+        reg.register(_StubTool("A", description="alpha tool", deferred=True))
+        reg.register(_StubTool("B", description="beta tool", deferred=True))
+        reg.register(_StubTool("C", description="eager", deferred=False))
+        pairs = dict(reg.list_deferred())
+        assert pairs == {"A": "alpha tool", "B": "beta tool"}
+
+    def test_all_names_includes_both(self):
+        reg = vc.ToolRegistry()
+        reg.register(_StubTool("E", deferred=False))
+        reg.register(_StubTool("D", deferred=True))
+        assert set(reg.all_names()) == {"E", "D"}
+
+
+class TestDeferredToolsBlock:
+
+    def test_empty_registry_yields_empty_block(self):
+        reg = vc.ToolRegistry()
+        assert vc._build_deferred_tools_block(reg) == ""
+
+    def test_no_deferred_tools_yields_empty_block(self):
+        reg = vc.ToolRegistry()
+        reg.register(_StubTool("Eager"))
+        assert vc._build_deferred_tools_block(reg) == ""
+
+    def test_block_contains_name_and_description(self):
+        reg = vc.ToolRegistry()
+        reg.register(_StubTool("foo_tool", description="search foo things",
+                               deferred=True))
+        block = vc._build_deferred_tools_block(reg)
+        assert "# Deferred Tools" in block
+        assert "foo_tool" in block
+        assert "search foo things" in block
+        # explains how to load
+        assert "ToolSearch" in block
+
+
+class TestToolSearch:
+
+    def _registry_with(self, *defs):
+        reg = vc.ToolRegistry()
+        for name, desc in defs:
+            reg.register(_StubTool(name, description=desc, deferred=True))
+        return reg
+
+    def test_empty_query_errors(self):
+        reg = self._registry_with(("a_tool", "x"))
+        ts = vc.ToolSearchTool(reg)
+        r = ts.execute({"query": "  "})
+        assert r.startswith("Error:")
+
+    def test_no_deferred_tools_message(self):
+        reg = vc.ToolRegistry()
+        ts = vc.ToolSearchTool(reg)
+        r = ts.execute({"query": "anything"})
+        assert "No deferred tools" in r
+
+    def test_select_loads_named_tools(self):
+        reg = self._registry_with(
+            ("alpha", "alpha desc"),
+            ("beta", "beta desc"),
+            ("gamma", "gamma desc"),
+        )
+        ts = vc.ToolSearchTool(reg)
+        r = ts.execute({"query": "select:alpha,gamma"})
+        assert "alpha" in r and "gamma" in r
+        assert "beta" not in r
+        # Promoted: now eager
+        eager = [s["function"]["name"] for s in reg.get_schemas()]
+        assert "alpha" in eager
+        assert "gamma" in eager
+        assert "beta" not in eager
+        assert reg.is_deferred("alpha") is False
+        assert reg.is_deferred("beta") is True
+
+    def test_select_unknown_reports_missing(self):
+        reg = self._registry_with(("alpha", "x"))
+        ts = vc.ToolSearchTool(reg)
+        r = ts.execute({"query": "select:alpha,ghost"})
+        assert "alpha" in r
+        assert "ghost" in r  # mentioned in missing
+        assert "Skipped" in r or "unknown" in r
+
+    def test_keyword_search_ranks_by_match(self):
+        reg = self._registry_with(
+            ("aa", "alpha thing"),
+            ("bb", "this tool finds beta keyword"),
+            ("cc", "alpha and beta"),
+            ("dd", "unrelated"),
+        )
+        ts = vc.ToolSearchTool(reg)
+        r = ts.execute({"query": "alpha", "max_results": 5})
+        # All three with 'alpha' in name or desc should appear
+        assert "aa" in r and "cc" in r
+        assert "dd" not in r
+
+    def test_required_term_filter(self):
+        reg = self._registry_with(
+            ("pull_requests", "search github prs"),
+            ("issues", "search github issues"),
+            ("notes", "personal notes"),
+        )
+        ts = vc.ToolSearchTool(reg)
+        r = ts.execute({"query": "+github search"})
+        # only entries containing 'github' (the required +) should appear
+        assert "pull_requests" in r
+        assert "issues" in r
+        assert "notes" not in r
+
+    def test_no_matches_message(self):
+        reg = self._registry_with(("alpha", "x"))
+        ts = vc.ToolSearchTool(reg)
+        r = ts.execute({"query": "completely_different_keyword"})
+        assert "No deferred tools matched" in r
+
+    def test_max_results_limit(self):
+        reg = self._registry_with(
+            *[(f"t{i}", "common keyword shared") for i in range(10)]
+        )
+        ts = vc.ToolSearchTool(reg)
+        r = ts.execute({"query": "common", "max_results": 3})
+        # Exactly 3 promoted
+        promoted_count = sum(1 for i in range(10)
+                             if reg.is_deferred(f"t{i}") is False)
+        assert promoted_count == 3
+
+    def test_max_results_clamped(self):
+        reg = self._registry_with(
+            *[(f"t{i}", "common shared") for i in range(5)]
+        )
+        ts = vc.ToolSearchTool(reg)
+        # Request 999 — should be clamped to TOOL_SEARCH_MAX_LIMIT, not error
+        r = ts.execute({"query": "common", "max_results": 999})
+        assert r  # no exception
+        promoted = sum(1 for i in range(5) if reg.is_deferred(f"t{i}") is False)
+        assert promoted == 5
+
+    def test_returns_full_schema(self):
+        reg = self._registry_with(("foo", "the foo tool"))
+        ts = vc.ToolSearchTool(reg)
+        r = ts.execute({"query": "select:foo"})
+        # JSON schema rendered with description
+        assert '"name": "foo"' in r
+        assert '"description"' in r
