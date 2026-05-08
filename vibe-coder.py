@@ -36,8 +36,10 @@ import base64
 import atexit
 import struct
 import sqlite3
+import shlex
+import secrets
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 import collections
 import concurrent.futures
 
@@ -4852,6 +4854,482 @@ class HooksManager:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# Cron — Schedule prompts via the OS scheduler (launchd / cron / schtasks)
+# ════════════════════════════════════════════════════════════════════════════════
+#
+# vibe-local is an on-demand CLI, not a daemon — so recurring tasks are
+# delegated to the host's scheduler. The CronManager renders a launchd plist
+# (macOS) or a crontab line (Linux) or a schtasks command (Windows), installs
+# it, and tracks the install in `~/.config/vibe-local/crons.json`. Deletion
+# uses the ledger to find what to uninstall.
+
+CRON_LEDGER_FILENAME = "crons.json"
+CRON_NAME_RE = re.compile(r'^[A-Za-z0-9_\-]+$')
+CRON_FIELD_RE = re.compile(r'^(\*|\d+|\*/\d+)$')
+
+
+def _validate_cron_expression(expr):
+    """Return (parts, error). Currently accepts fields '*', integers, and '*/N'.
+
+    More complex forms (lists, ranges) are rejected with a helpful message
+    rather than silently producing wrong launchd output.
+    """
+    if not isinstance(expr, str):
+        return None, "schedule must be a string"
+    parts = expr.strip().split()
+    if len(parts) != 5:
+        return None, (f"cron expression must have 5 space-separated fields "
+                      f"(M H D Mo W); got {len(parts)}")
+    for label, field in zip(("minute", "hour", "day", "month", "weekday"), parts):
+        if not CRON_FIELD_RE.match(field):
+            return None, (f"unsupported {label} field {field!r}. "
+                          f"This implementation accepts '*', integers, and '*/N'. "
+                          f"Lists ('1,3') and ranges ('1-5') are not yet supported.")
+    return parts, None
+
+
+def _cron_to_launchd(expr):
+    """Convert a validated cron expression to (kind, value) for launchd.
+
+    kind is "interval" (seconds) for `*/N * * * *` / `0 */N * * *`, or
+    "calendar" (dict of capitalized launchd keys) for fixed-time triggers.
+    Returns (None, None, error) if the pattern cannot be expressed.
+    """
+    parts, err = _validate_cron_expression(expr)
+    if err:
+        return None, None, err
+    minute, hour, day, month, weekday = parts
+
+    # */N minute → StartInterval (seconds)
+    if minute.startswith("*/") and hour == "*" and day == "*" and month == "*" and weekday == "*":
+        n = int(minute[2:])
+        if n < 1:
+            return None, None, "*/0 is not a valid step"
+        return "interval", n * 60, None
+
+    # 0 */N * * * → every N hours
+    if (minute == "0" and hour.startswith("*/")
+            and day == "*" and month == "*" and weekday == "*"):
+        n = int(hour[2:])
+        if n < 1:
+            return None, None, "*/0 is not a valid step"
+        return "interval", n * 3600, None
+
+    # Otherwise: calendar fields, where any '*' means "every value"
+    cal = {}
+    fields = (("Minute", minute), ("Hour", hour), ("Day", day),
+              ("Month", month), ("Weekday", weekday))
+    for key, field in fields:
+        if field == "*":
+            continue
+        if field.startswith("*/"):
+            return None, None, (f"step ('*/N') is only supported in the "
+                                f"minute or hour field for the all-other-fields-* case")
+        cal[key] = int(field)
+    if not cal:
+        return None, None, ("schedule reduces to 'every minute' which is too "
+                            "aggressive; use '*/N * * * *' to opt in explicitly")
+    return "calendar", cal, None
+
+
+def _xml_escape(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace("'", "&apos;").replace('"', "&quot;"))
+
+
+def _render_launchd_plist(label, schedule_kind, schedule_value, command, log_path):
+    """Render an XML plist for launchd. Returns the full document text."""
+    head = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n'
+        '<dict>\n'
+        f'    <key>Label</key>\n    <string>{_xml_escape(label)}</string>\n'
+        '    <key>ProgramArguments</key>\n'
+        '    <array>\n'
+        '        <string>/bin/sh</string>\n'
+        '        <string>-c</string>\n'
+        f'        <string>{_xml_escape(command)}</string>\n'
+        '    </array>\n'
+        f'    <key>StandardOutPath</key>\n    <string>{_xml_escape(log_path)}</string>\n'
+        f'    <key>StandardErrorPath</key>\n    <string>{_xml_escape(log_path)}</string>\n'
+    )
+    if schedule_kind == "interval":
+        body = f'    <key>StartInterval</key>\n    <integer>{int(schedule_value)}</integer>\n'
+    else:  # calendar
+        rows = "".join(
+            f"        <key>{key}</key>\n        <integer>{int(val)}</integer>\n"
+            for key, val in schedule_value.items()
+        )
+        body = f'    <key>StartCalendarInterval</key>\n    <dict>\n{rows}    </dict>\n'
+    return head + body + '</dict>\n</plist>\n'
+
+
+def _render_crontab_line(schedule, command, cron_id):
+    """Render a single crontab line tagged with a vibe-local marker comment."""
+    return f"{schedule} {command} # vibe-local:{cron_id}"
+
+
+def _crontab_marker(cron_id):
+    return f"# vibe-local:{cron_id}"
+
+
+class CronManager:
+    """Schedule prompts via the host OS scheduler.
+
+    The on-disk ledger at config_dir/crons.json records every install so the
+    manager can list and undo them later. Tests can inject `subprocess_run`
+    and `launch_agents_dir` overrides to exercise the install path without
+    actually mutating the user's system.
+    """
+
+    def __init__(self, config, *, subprocess_run=None, launch_agents_dir=None):
+        self.config = config
+        self.platform = sys.platform
+        self.ledger_path = os.path.join(config.config_dir, CRON_LEDGER_FILENAME)
+        self.log_dir = os.path.join(config.config_dir, "cron-logs")
+        self._run = subprocess_run if subprocess_run is not None else subprocess.run
+        self.launch_agents_dir = launch_agents_dir or os.path.join(
+            os.path.expanduser("~"), "Library", "LaunchAgents")
+
+    # ---- ledger helpers ----------------------------------------------------
+
+    def _load_ledger(self):
+        if not os.path.isfile(self.ledger_path) or os.path.islink(self.ledger_path):
+            return []
+        try:
+            with open(self.ledger_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return []
+        return data if isinstance(data, list) else []
+
+    def _save_ledger(self, entries):
+        try:
+            os.makedirs(self.config.config_dir, mode=0o700, exist_ok=True)
+            with open(self.ledger_path, "w", encoding="utf-8") as f:
+                json.dump(entries, f, indent=2)
+        except OSError as e:
+            return f"failed to update ledger: {e}"
+        return None
+
+    @staticmethod
+    def _gen_id():
+        return f"vibe_{secrets.token_hex(4)}"
+
+    # ---- public API --------------------------------------------------------
+
+    def create(self, schedule, prompt, name=None):
+        """Returns (cron_id, error). On success error is None."""
+        parts, err = _validate_cron_expression(schedule)
+        if err:
+            return None, err
+        if not (prompt and isinstance(prompt, str) and prompt.strip()):
+            return None, "prompt is required"
+        cron_id = (name or self._gen_id()).strip()
+        if not CRON_NAME_RE.match(cron_id):
+            return None, ("name must contain only ASCII letters, digits, "
+                          "'_' or '-'")
+        ledger = self._load_ledger()
+        if any(e.get("id") == cron_id for e in ledger):
+            return None, f"cron id '{cron_id}' already exists"
+
+        try:
+            os.makedirs(self.log_dir, mode=0o700, exist_ok=True)
+        except OSError as e:
+            return None, f"cannot create cron-logs dir: {e}"
+        log_path = os.path.join(self.log_dir, f"{cron_id}.log")
+        vibe_bin = self._find_vibe_local_bin()
+        command = (f"{shlex.quote(vibe_bin)} -p {shlex.quote(prompt)} "
+                   f">> {shlex.quote(log_path)} 2>&1")
+
+        if self.platform == "darwin":
+            install_err = self._install_launchd(cron_id, schedule, command, log_path)
+        elif self.platform.startswith("linux"):
+            install_err = self._install_crontab(cron_id, schedule, command)
+        elif self.platform == "win32":
+            install_err = self._install_schtasks(cron_id, schedule, command)
+        else:
+            return None, f"unsupported platform: {self.platform}"
+        if install_err:
+            return None, install_err
+
+        entry = {
+            "id": cron_id,
+            "schedule": schedule,
+            "prompt": prompt,
+            "platform": self.platform,
+            "log_path": log_path,
+            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        ledger.append(entry)
+        save_err = self._save_ledger(ledger)
+        if save_err:
+            return None, save_err
+        return cron_id, None
+
+    def list(self):
+        return self._load_ledger()
+
+    def delete(self, cron_id):
+        ledger = self._load_ledger()
+        entry = next((e for e in ledger if e.get("id") == cron_id), None)
+        if entry is None:
+            return False, f"cron id '{cron_id}' not found"
+        platform_when_created = entry.get("platform", self.platform)
+        if platform_when_created == "darwin":
+            err = self._uninstall_launchd(cron_id)
+        elif str(platform_when_created).startswith("linux"):
+            err = self._uninstall_crontab(cron_id)
+        elif platform_when_created == "win32":
+            err = self._uninstall_schtasks(cron_id)
+        else:
+            err = f"unsupported platform on stored entry: {platform_when_created}"
+        # Remove from ledger even if uninstall reported a soft error (e.g. plist
+        # already gone). This keeps the ledger truthful.
+        new_ledger = [e for e in ledger if e.get("id") != cron_id]
+        save_err = self._save_ledger(new_ledger)
+        if save_err:
+            return False, save_err
+        return True, err  # caller may treat err as a warning
+
+    # ---- launchd (macOS) ---------------------------------------------------
+
+    def _plist_path(self, cron_id):
+        return os.path.join(self.launch_agents_dir, f"com.vibe-local.{cron_id}.plist")
+
+    def _install_launchd(self, cron_id, schedule, command, log_path):
+        kind, value, err = _cron_to_launchd(schedule)
+        if err:
+            return err
+        label = f"com.vibe-local.{cron_id}"
+        try:
+            os.makedirs(self.launch_agents_dir, mode=0o755, exist_ok=True)
+        except OSError as e:
+            return f"cannot create LaunchAgents dir: {e}"
+        plist_path = self._plist_path(cron_id)
+        plist_text = _render_launchd_plist(label, kind, value, command, log_path)
+        try:
+            with open(plist_path, "w", encoding="utf-8") as f:
+                f.write(plist_text)
+        except OSError as e:
+            return f"cannot write plist: {e}"
+        try:
+            uid = os.getuid()
+        except AttributeError:
+            uid = 0
+        # `launchctl bootstrap` is the modern API; fall back to `load` if missing
+        rv = self._run(["launchctl", "bootstrap", f"gui/{uid}", plist_path],
+                       capture_output=True, text=True)
+        if rv.returncode != 0:
+            # Some macOS versions return non-zero for already-loaded; try `load`
+            self._run(["launchctl", "load", "-w", plist_path],
+                      capture_output=True, text=True)
+        return None
+
+    def _uninstall_launchd(self, cron_id):
+        plist_path = self._plist_path(cron_id)
+        label = f"com.vibe-local.{cron_id}"
+        try:
+            uid = os.getuid()
+        except AttributeError:
+            uid = 0
+        # Best-effort: try modern API, then legacy
+        self._run(["launchctl", "bootout", f"gui/{uid}/{label}"],
+                  capture_output=True, text=True)
+        self._run(["launchctl", "unload", "-w", plist_path],
+                  capture_output=True, text=True)
+        try:
+            if os.path.isfile(plist_path):
+                os.unlink(plist_path)
+        except OSError as e:
+            return f"plist remove failed: {e}"
+        return None
+
+    # ---- crontab (Linux) ---------------------------------------------------
+
+    def _read_crontab(self):
+        rv = self._run(["crontab", "-l"], capture_output=True, text=True)
+        return rv.stdout if rv.returncode == 0 else ""
+
+    def _write_crontab(self, content):
+        rv = self._run(["crontab", "-"], input=content, capture_output=True, text=True)
+        if rv.returncode != 0:
+            return rv.stderr or f"crontab returned {rv.returncode}"
+        return None
+
+    def _install_crontab(self, cron_id, schedule, command):
+        existing = self._read_crontab()
+        marker = _crontab_marker(cron_id)
+        if marker in existing:
+            return f"crontab already contains an entry for {cron_id}"
+        line = _render_crontab_line(schedule, command, cron_id)
+        new_content = existing
+        if not new_content.endswith("\n") and new_content:
+            new_content += "\n"
+        new_content += line + "\n"
+        return self._write_crontab(new_content)
+
+    def _uninstall_crontab(self, cron_id):
+        existing = self._read_crontab()
+        marker = _crontab_marker(cron_id)
+        if marker not in existing:
+            return None  # already gone, fine
+        kept = [ln for ln in existing.splitlines()
+                if marker not in ln]
+        new_content = "\n".join(kept) + ("\n" if kept else "")
+        return self._write_crontab(new_content)
+
+    # ---- schtasks (Windows) ------------------------------------------------
+
+    def _schtasks_name(self, cron_id):
+        return f"vibe-local-{cron_id}"
+
+    def _install_schtasks(self, cron_id, schedule, command):
+        # Best-effort minimal coverage — daily-at-time only. More patterns
+        # are out of scope for v1; users can fall back to manual schtasks.
+        kind, value, err = _cron_to_launchd(schedule)
+        if err:
+            return err
+        if kind == "calendar" and "Hour" in value and "Minute" in value and len(value) == 2:
+            t = f"{int(value['Hour']):02d}:{int(value['Minute']):02d}"
+            args = ["schtasks", "/Create", "/SC", "DAILY",
+                    "/TN", self._schtasks_name(cron_id),
+                    "/TR", command, "/ST", t, "/F"]
+        elif kind == "interval":
+            minutes = max(1, int(value) // 60)
+            args = ["schtasks", "/Create", "/SC", "MINUTE", "/MO", str(minutes),
+                    "/TN", self._schtasks_name(cron_id),
+                    "/TR", command, "/F"]
+        else:
+            return ("Windows schtasks bridge only supports daily-at-time and "
+                    "minute intervals in v1; please install manually.")
+        rv = self._run(args, capture_output=True, text=True)
+        if rv.returncode != 0:
+            return rv.stderr or f"schtasks returned {rv.returncode}"
+        return None
+
+    def _uninstall_schtasks(self, cron_id):
+        args = ["schtasks", "/Delete", "/TN", self._schtasks_name(cron_id), "/F"]
+        self._run(args, capture_output=True, text=True)
+        return None
+
+    # ---- helpers -----------------------------------------------------------
+
+    @staticmethod
+    def _find_vibe_local_bin():
+        """Return the most likely path of the vibe-local binary.
+
+        Falls back to the Python interpreter + this script if no `vibe-local`
+        is found on PATH so the cron entry remains executable.
+        """
+        path = shutil.which("vibe-local")
+        if path:
+            return path
+        # Fall back to interpreter + script path
+        return f"{sys.executable} {os.path.abspath(sys.argv[0])}"
+
+
+class CronCreateTool(Tool):
+    """Schedule a vibe-local prompt via the OS scheduler."""
+    name = "CronCreate"
+    description = (
+        "Schedule a recurring vibe-local one-shot prompt using the host OS "
+        "scheduler (launchd on macOS, cron on Linux, schtasks on Windows). "
+        "`schedule` is a 5-field cron expression where each field is '*', a "
+        "single integer, or '*/N' (the latter only in the minute or hour "
+        "field with all other fields '*'). Examples: '0 9 * * *' runs daily "
+        "at 09:00; '*/15 * * * *' runs every 15 minutes."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "schedule": {"type": "string",
+                         "description": "5-field cron expression."},
+            "prompt": {"type": "string",
+                       "description": "Prompt to feed to `vibe-local -p` at each tick."},
+            "name": {"type": "string",
+                     "description": "Optional id (alphanumerics / _ / -). Auto-generated if omitted."},
+        },
+        "required": ["schedule", "prompt"],
+    }
+
+    def __init__(self, config):
+        self.config = config
+
+    def execute(self, params):
+        schedule = (params.get("schedule") or "").strip()
+        prompt = params.get("prompt") or ""
+        name = (params.get("name") or "").strip() or None
+        mgr = CronManager(self.config)
+        cron_id, err = mgr.create(schedule, prompt, name=name)
+        if err:
+            return f"Error: {err}"
+        return (f"Scheduled cron '{cron_id}' [{schedule}]\n"
+                f"Logs: {os.path.join(mgr.log_dir, cron_id + '.log')}")
+
+
+class CronListTool(Tool):
+    """List scheduled cron entries from the local ledger."""
+    name = "CronList"
+    description = (
+        "List every cron entry vibe-local has installed on this host (from "
+        "the local ledger at ~/.config/vibe-local/crons.json). Each entry "
+        "includes id, schedule, prompt, platform, and creation timestamp."
+    )
+    parameters = {"type": "object", "properties": {}}
+
+    def __init__(self, config):
+        self.config = config
+
+    def execute(self, params):
+        mgr = CronManager(self.config)
+        entries = mgr.list()
+        if not entries:
+            return "No scheduled cron entries."
+        lines = []
+        for e in entries:
+            prompt_preview = (e.get("prompt") or "")[:60].replace("\n", " ")
+            lines.append(
+                f"- {e.get('id')}: [{e.get('schedule')}] on {e.get('platform')} "
+                f"(created {e.get('created_at')})\n    prompt: {prompt_preview!r}"
+            )
+        return "\n".join(lines)
+
+
+class CronDeleteTool(Tool):
+    """Remove a scheduled cron entry by id."""
+    name = "CronDelete"
+    description = (
+        "Remove a previously scheduled cron entry from both the local ledger "
+        "and the host OS scheduler. The entry is identified by the id "
+        "returned by CronCreate."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string",
+                   "description": "The cron id to remove (e.g. 'vibe_a1b2c3d4')."},
+        },
+        "required": ["id"],
+    }
+
+    def __init__(self, config):
+        self.config = config
+
+    def execute(self, params):
+        cron_id = (params.get("id") or "").strip()
+        if not cron_id:
+            return "Error: id is required"
+        mgr = CronManager(self.config)
+        ok, err = mgr.delete(cron_id)
+        if not ok:
+            return f"Error: {err}"
+        return f"Removed cron '{cron_id}'." + (f" Note: {err}" if err else "")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Sub-Agent — Spawns a mini agent loop in a separate thread
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -8415,6 +8893,9 @@ def main():
     registry.register(MemoryUpdateTool(config))
     registry.register(MemoryDeleteTool(config))
     registry.register(MemoryListTool(config))
+    registry.register(CronCreateTool(config))
+    registry.register(CronListTool(config))
+    registry.register(CronDeleteTool(config))
     registry.register(ToolSearchTool(registry))
     registry.register(SubAgentTool(config, client, registry, permissions))
     coordinator = MultiAgentCoordinator(config, client, registry, permissions)
