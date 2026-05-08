@@ -738,6 +738,7 @@ class Config:
 
         self.config_file = os.path.join(self.config_dir, "config")
         self.permissions_file = os.path.join(self.config_dir, "permissions.json")
+        self.memory_dir = os.path.join(self.config_dir, "memory")
         self.sessions_dir = os.path.join(self.state_dir, "sessions")
         self.history_file = os.path.join(self.state_dir, "history")
 
@@ -1116,7 +1117,7 @@ class Config:
                 setattr(self, attr, "" if attr == "sidecar_model" else self.DEFAULT_MODEL)
 
     def _ensure_dirs(self):
-        for d in [self.config_dir, self.state_dir, self.sessions_dir]:
+        for d in [self.config_dir, self.state_dir, self.sessions_dir, self.memory_dir]:
             try:
                 os.makedirs(d, mode=0o700, exist_ok=True)
             except PermissionError:
@@ -1393,6 +1394,14 @@ IMPORTANT — This is Windows (NOT Linux/macOS):
         except Exception as e:
             print(f"{C.YELLOW}Warning: Could not read {fname}: {e}{C.RESET}",
                   file=sys.stderr)
+
+    # 3. Persistent memory (~/.config/vibe-local/memory/MEMORY.md)
+    try:
+        memory_block = _load_memory_block(config)
+        if memory_block:
+            prompt += memory_block
+    except Exception:
+        pass
 
     return prompt
 
@@ -4003,6 +4012,306 @@ class AskUserQuestionTool(Tool):
         return f"User answered: {answer}"
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+# Memory — Persistent file-based long-term memory
+# ════════════════════════════════════════════════════════════════════════════════
+
+MEMORY_INDEX_FILENAME = "MEMORY.md"
+MEMORY_TYPES = ("user", "feedback", "project", "reference")
+MEMORY_INDEX_MAX_LINES = 200
+_MEMORY_NAME_RE = re.compile(r'^[A-Za-z0-9_\-]+$')
+
+
+def _memory_index_path(config):
+    return os.path.join(config.memory_dir, MEMORY_INDEX_FILENAME)
+
+
+def _validate_memory_name(name):
+    if not name:
+        return "name is required"
+    if len(name) > 80:
+        return "name too long (max 80 chars)"
+    if not _MEMORY_NAME_RE.match(name):
+        return "name must contain only ASCII letters, digits, '_' or '-'"
+    return None
+
+
+def _load_memory_block(config):
+    """Read MEMORY.md and return a system-prompt block, or '' if no memory exists."""
+    index_path = _memory_index_path(config)
+    if not os.path.isfile(index_path) or os.path.islink(index_path):
+        return ""
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return ""
+    if not lines:
+        return ""
+    truncated = False
+    if len(lines) > MEMORY_INDEX_MAX_LINES:
+        lines = lines[:MEMORY_INDEX_MAX_LINES]
+        truncated = True
+    body = "".join(lines).rstrip()
+    note = (f"\n[memory index truncated at {MEMORY_INDEX_MAX_LINES} lines — "
+            f"see {index_path} for full list]") if truncated else ""
+    guidance = (
+        "Use Memory tools (MemoryWrite/MemoryUpdate/MemoryDelete/MemoryList) to "
+        "persist facts across sessions. Save user preferences (type=user), "
+        "corrections (feedback), project facts (project), or external pointers "
+        "(reference). Do NOT save things derivable from the codebase or "
+        "ephemeral session state."
+    )
+    return f"\n# Memory\n\n{guidance}\n\n{body}{note}\n"
+
+
+def _read_memory_frontmatter(fpath):
+    """Return (frontmatter_text, body) or (None, None) if no frontmatter."""
+    try:
+        with open(fpath, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError:
+        return None, None
+    m = re.match(r'^(---\n.*?\n---\n)(.*)$', content, flags=re.DOTALL)
+    if not m:
+        return None, None
+    return m.group(1), m.group(2)
+
+
+class MemoryWriteTool(Tool):
+    """Create a new memory file under config.memory_dir."""
+    name = "MemoryWrite"
+    description = (
+        "Save a memory file that persists across sessions under "
+        "~/.config/vibe-local/memory/. Use for: user preferences/role (type=user), "
+        "past corrections from the user (feedback), project facts/decisions/deadlines "
+        "(project), or pointers to external systems (reference). "
+        "Do NOT use for things derivable from code or git history. "
+        "Fails if a memory with the same name already exists — use MemoryUpdate instead."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "File stem (no extension). ASCII letters, digits, '_' or '-' only.",
+            },
+            "type": {
+                "type": "string",
+                "description": "One of: user, feedback, project, reference",
+            },
+            "description": {
+                "type": "string",
+                "description": "One-line summary used in the MEMORY.md index",
+            },
+            "content": {
+                "type": "string",
+                "description": "Memory body in Markdown",
+            },
+        },
+        "required": ["name", "type", "description", "content"],
+    }
+
+    def __init__(self, config):
+        self.config = config
+
+    def execute(self, params):
+        name = (params.get("name") or "").strip()
+        mtype = (params.get("type") or "").strip()
+        desc = (params.get("description") or "").strip()
+        content = params.get("content") or ""
+        err = _validate_memory_name(name)
+        if err:
+            return f"Error: {err}"
+        if mtype not in MEMORY_TYPES:
+            return f"Error: type must be one of {list(MEMORY_TYPES)}"
+        if not desc:
+            return "Error: description is required"
+        if not content.strip():
+            return "Error: content is required"
+        try:
+            os.makedirs(self.config.memory_dir, mode=0o700, exist_ok=True)
+        except OSError as e:
+            return f"Error: cannot create memory dir: {e}"
+        fname = f"{name}.md"
+        fpath = os.path.join(self.config.memory_dir, fname)
+        if os.path.lexists(fpath):
+            return f"Error: memory '{name}' already exists. Use MemoryUpdate to modify."
+        # Sanitize description: collapse newlines and neutralize frontmatter delimiters
+        safe_desc = desc.replace("\n", " ").replace("\r", " ")
+        safe_desc = re.sub(r'-{3,}', '—', safe_desc)
+        body = (
+            "---\n"
+            f"name: {name}\n"
+            f"description: {safe_desc}\n"
+            f"type: {mtype}\n"
+            "---\n\n"
+            f"{content.rstrip()}\n"
+        )
+        try:
+            with open(fpath, "w", encoding="utf-8") as f:
+                f.write(body)
+        except OSError as e:
+            return f"Error writing memory: {e}"
+        # Append to MEMORY.md index
+        index_path = _memory_index_path(self.config)
+        try:
+            with open(index_path, "a", encoding="utf-8") as f:
+                f.write(f"- [{name}]({fname}) — {safe_desc}\n")
+        except OSError as e:
+            return f"Memory written to {fpath} but index update failed: {e}"
+        return f"Saved memory '{name}' (type={mtype}) to {fpath}"
+
+
+class MemoryUpdateTool(Tool):
+    """Replace the body of an existing memory file. Frontmatter is preserved."""
+    name = "MemoryUpdate"
+    description = (
+        "Update the body of an existing memory file. Frontmatter (name/description/type) "
+        "is preserved. Use when a fact changes or needs revision. Fails if the memory "
+        "does not exist — use MemoryWrite to create."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Memory name (without .md extension)",
+            },
+            "content": {
+                "type": "string",
+                "description": "New body content (Markdown). Replaces the previous body.",
+            },
+        },
+        "required": ["name", "content"],
+    }
+
+    def __init__(self, config):
+        self.config = config
+
+    def execute(self, params):
+        name = (params.get("name") or "").strip()
+        content = params.get("content") or ""
+        err = _validate_memory_name(name)
+        if err:
+            return f"Error: {err}"
+        if not content.strip():
+            return "Error: content is required"
+        fpath = os.path.join(self.config.memory_dir, f"{name}.md")
+        if os.path.islink(fpath):
+            return "Error: refusing to update memory through a symlink"
+        if not os.path.isfile(fpath):
+            return f"Error: memory '{name}' does not exist. Use MemoryWrite to create."
+        frontmatter, _old_body = _read_memory_frontmatter(fpath)
+        if frontmatter is None:
+            return f"Error: memory '{name}' has no frontmatter — cannot safely update"
+        try:
+            with open(fpath, "w", encoding="utf-8") as f:
+                f.write(frontmatter + "\n" + content.rstrip() + "\n")
+        except OSError as e:
+            return f"Error writing memory: {e}"
+        return f"Updated memory '{name}'"
+
+
+class MemoryDeleteTool(Tool):
+    """Delete a memory file and remove its line from MEMORY.md."""
+    name = "MemoryDelete"
+    description = (
+        "Delete a memory file and remove its entry from MEMORY.md. "
+        "Use when a memory is wrong, outdated, or no longer relevant."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Memory name (without .md extension)",
+            },
+        },
+        "required": ["name"],
+    }
+
+    def __init__(self, config):
+        self.config = config
+
+    def execute(self, params):
+        name = (params.get("name") or "").strip()
+        err = _validate_memory_name(name)
+        if err:
+            return f"Error: {err}"
+        fpath = os.path.join(self.config.memory_dir, f"{name}.md")
+        if os.path.islink(fpath):
+            return "Error: refusing to delete through a symlink"
+        if not os.path.isfile(fpath):
+            return f"Error: memory '{name}' does not exist"
+        try:
+            os.unlink(fpath)
+        except OSError as e:
+            return f"Error deleting memory: {e}"
+        index_path = _memory_index_path(self.config)
+        if os.path.isfile(index_path):
+            try:
+                with open(index_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                pattern = re.compile(rf'^\s*-\s*\[{re.escape(name)}\]\(')
+                kept = [ln for ln in lines if not pattern.match(ln)]
+                with open(index_path, "w", encoding="utf-8") as f:
+                    f.writelines(kept)
+            except OSError:
+                pass
+        return f"Deleted memory '{name}'"
+
+
+class MemoryListTool(Tool):
+    """List all memory files with their type and description."""
+    name = "MemoryList"
+    description = (
+        "List all stored memory files with their type and description. "
+        "Useful before deciding whether to create a new memory or update an existing one."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {},
+    }
+
+    def __init__(self, config):
+        self.config = config
+
+    def execute(self, params):
+        mem_dir = self.config.memory_dir
+        if not os.path.isdir(mem_dir):
+            return "No memories yet."
+        try:
+            names = sorted(os.listdir(mem_dir))
+        except OSError as e:
+            return f"Error listing memory dir: {e}"
+        entries = []
+        for fname in names:
+            if not fname.endswith(".md") or fname == MEMORY_INDEX_FILENAME:
+                continue
+            fpath = os.path.join(mem_dir, fname)
+            if os.path.islink(fpath) or not os.path.isfile(fpath):
+                continue
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    head = f.read(2000)
+            except OSError:
+                continue
+            mtype = ""
+            desc = ""
+            m = re.search(r'^type:\s*(\S+)', head, flags=re.MULTILINE)
+            if m:
+                mtype = m.group(1)
+            m = re.search(r'^description:\s*(.+)$', head, flags=re.MULTILINE)
+            if m:
+                desc = m.group(1).strip()
+            entries.append(f"- {fname[:-3]} [{mtype}] {desc}".rstrip())
+        if not entries:
+            return "No memories yet."
+        return "\n".join(entries)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Sub-Agent — Spawns a mini agent loop in a separate thread
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -7469,6 +7778,10 @@ def main():
     session.set_client(client)  # enable sidecar model for context compaction
     registry = ToolRegistry().register_defaults()
     permissions = PermissionMgr(config)
+    registry.register(MemoryWriteTool(config))
+    registry.register(MemoryUpdateTool(config))
+    registry.register(MemoryDeleteTool(config))
+    registry.register(MemoryListTool(config))
     registry.register(SubAgentTool(config, client, registry, permissions))
     coordinator = MultiAgentCoordinator(config, client, registry, permissions)
     registry.register(ParallelAgentTool(coordinator))

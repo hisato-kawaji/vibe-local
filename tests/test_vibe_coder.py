@@ -10287,3 +10287,263 @@ class TestPermissionInputHandling:
                 with mock.patch.object(vc.TUI, "_read_permission_input", return_value=inp):
                     result = tui.ask_permission("Bash", {"command": "ls"})
                     assert result == "allow_all", f"Input '{inp}' should return 'allow_all'"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Memory — Persistent file-based long-term memory
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _make_memory_config(tmp_path):
+    """Build a Config-like object pointing at tmp_path for memory tests."""
+    cfg = vc.Config()
+    cfg.config_dir = str(tmp_path)
+    cfg.memory_dir = str(tmp_path / "memory")
+    os.makedirs(cfg.memory_dir, mode=0o700, exist_ok=True)
+    return cfg
+
+
+class TestMemoryConfig:
+    """memory_dir should be wired into Config and _ensure_dirs."""
+
+    def test_default_memory_dir_is_under_config_dir(self):
+        cfg = vc.Config()
+        assert cfg.memory_dir == os.path.join(cfg.config_dir, "memory")
+
+    def test_ensure_dirs_creates_memory_dir(self, tmp_path, monkeypatch):
+        cfg = vc.Config()
+        cfg.config_dir = str(tmp_path / "cfg")
+        cfg.state_dir = str(tmp_path / "state")
+        cfg.sessions_dir = str(tmp_path / "state" / "sessions")
+        cfg.memory_dir = str(tmp_path / "cfg" / "memory")
+        cfg._old_state_dir = str(tmp_path / "old_state")
+        cfg._ensure_dirs()
+        assert os.path.isdir(cfg.memory_dir)
+
+
+class TestMemoryWriteTool:
+
+    def test_creates_file_with_frontmatter_and_index_entry(self, tmp_path):
+        cfg = _make_memory_config(tmp_path)
+        tool = vc.MemoryWriteTool(cfg)
+        result = tool.execute({
+            "name": "user_role",
+            "type": "user",
+            "description": "Backend engineer who uses local LLMs",
+            "content": "Prefers terse responses, deep Go expertise, new to React.",
+        })
+        assert "Saved memory 'user_role'" in result
+        fpath = tmp_path / "memory" / "user_role.md"
+        assert fpath.is_file()
+        body = fpath.read_text(encoding="utf-8")
+        assert body.startswith("---\n")
+        assert "name: user_role" in body
+        assert "type: user" in body
+        assert "Prefers terse responses" in body
+        # MEMORY.md index updated
+        index = (tmp_path / "memory" / "MEMORY.md").read_text(encoding="utf-8")
+        assert "- [user_role](user_role.md)" in index
+
+    def test_rejects_invalid_name(self, tmp_path):
+        cfg = _make_memory_config(tmp_path)
+        tool = vc.MemoryWriteTool(cfg)
+        for bad in ["with space", "../escape", "name/slash", "name.dot", ""]:
+            r = tool.execute({"name": bad, "type": "user",
+                              "description": "x", "content": "y"})
+            assert r.startswith("Error:"), f"name={bad!r} should be rejected, got: {r}"
+
+    def test_rejects_invalid_type(self, tmp_path):
+        cfg = _make_memory_config(tmp_path)
+        tool = vc.MemoryWriteTool(cfg)
+        r = tool.execute({"name": "foo", "type": "not_a_type",
+                          "description": "x", "content": "y"})
+        assert "type must be" in r
+
+    def test_rejects_empty_description_and_content(self, tmp_path):
+        cfg = _make_memory_config(tmp_path)
+        tool = vc.MemoryWriteTool(cfg)
+        r = tool.execute({"name": "foo", "type": "user",
+                          "description": "", "content": "y"})
+        assert "description is required" in r
+        r = tool.execute({"name": "foo", "type": "user",
+                          "description": "ok", "content": "   "})
+        assert "content is required" in r
+
+    def test_duplicate_name_fails(self, tmp_path):
+        cfg = _make_memory_config(tmp_path)
+        tool = vc.MemoryWriteTool(cfg)
+        ok = tool.execute({"name": "dup", "type": "user",
+                           "description": "first", "content": "body"})
+        assert ok.startswith("Saved")
+        r = tool.execute({"name": "dup", "type": "user",
+                          "description": "second", "content": "body2"})
+        assert "already exists" in r
+
+    def test_sanitizes_description_with_dashes(self, tmp_path):
+        cfg = _make_memory_config(tmp_path)
+        tool = vc.MemoryWriteTool(cfg)
+        # a description containing "---" should not break frontmatter
+        tool.execute({"name": "tricky", "type": "project",
+                      "description": "before --- after",
+                      "content": "body"})
+        body = (tmp_path / "memory" / "tricky.md").read_text(encoding="utf-8")
+        # frontmatter should still parse: exactly two `---` delimiters
+        assert body.count("\n---\n") == 1  # only the closing fence
+        assert body.startswith("---\n")
+        # injected --- inside description should be neutralized
+        assert "before — after" in body or "before -- after" in body or "before — after" in body
+
+
+class TestMemoryUpdateTool:
+
+    def test_replaces_body_preserves_frontmatter(self, tmp_path):
+        cfg = _make_memory_config(tmp_path)
+        vc.MemoryWriteTool(cfg).execute({
+            "name": "fact", "type": "project",
+            "description": "deadline", "content": "v1 ships on 2026-06-01",
+        })
+        upd = vc.MemoryUpdateTool(cfg)
+        r = upd.execute({"name": "fact", "content": "v1 slipped to 2026-07-15"})
+        assert "Updated memory 'fact'" in r
+        body = (tmp_path / "memory" / "fact.md").read_text(encoding="utf-8")
+        assert "type: project" in body
+        assert "v1 slipped" in body
+        assert "v1 ships" not in body  # old body replaced
+
+    def test_fails_when_missing(self, tmp_path):
+        cfg = _make_memory_config(tmp_path)
+        r = vc.MemoryUpdateTool(cfg).execute({"name": "ghost", "content": "x"})
+        assert "does not exist" in r
+
+    def test_refuses_symlink(self, tmp_path):
+        cfg = _make_memory_config(tmp_path)
+        target = tmp_path / "evil_target.md"
+        target.write_text("# unrelated\n", encoding="utf-8")
+        link = tmp_path / "memory" / "linked.md"
+        os.symlink(str(target), str(link))
+        r = vc.MemoryUpdateTool(cfg).execute({"name": "linked", "content": "x"})
+        assert "symlink" in r
+
+
+class TestMemoryDeleteTool:
+
+    def test_removes_file_and_index_entry(self, tmp_path):
+        cfg = _make_memory_config(tmp_path)
+        vc.MemoryWriteTool(cfg).execute({
+            "name": "one", "type": "user",
+            "description": "first", "content": "body",
+        })
+        vc.MemoryWriteTool(cfg).execute({
+            "name": "two", "type": "user",
+            "description": "second", "content": "body",
+        })
+        r = vc.MemoryDeleteTool(cfg).execute({"name": "one"})
+        assert "Deleted memory 'one'" in r
+        assert not (tmp_path / "memory" / "one.md").exists()
+        assert (tmp_path / "memory" / "two.md").exists()
+        index = (tmp_path / "memory" / "MEMORY.md").read_text(encoding="utf-8")
+        assert "[one]" not in index
+        assert "[two]" in index
+
+    def test_fails_when_missing(self, tmp_path):
+        cfg = _make_memory_config(tmp_path)
+        r = vc.MemoryDeleteTool(cfg).execute({"name": "ghost"})
+        assert "does not exist" in r
+
+
+class TestMemoryListTool:
+
+    def test_empty_dir(self, tmp_path):
+        cfg = _make_memory_config(tmp_path)
+        r = vc.MemoryListTool(cfg).execute({})
+        assert "No memories" in r
+
+    def test_lists_entries_with_type_and_desc(self, tmp_path):
+        cfg = _make_memory_config(tmp_path)
+        vc.MemoryWriteTool(cfg).execute({
+            "name": "alpha", "type": "user",
+            "description": "alpha desc", "content": "x",
+        })
+        vc.MemoryWriteTool(cfg).execute({
+            "name": "beta", "type": "feedback",
+            "description": "beta desc", "content": "x",
+        })
+        r = vc.MemoryListTool(cfg).execute({})
+        assert "- alpha [user] alpha desc" in r
+        assert "- beta [feedback] beta desc" in r
+
+    def test_ignores_index_and_non_md(self, tmp_path):
+        cfg = _make_memory_config(tmp_path)
+        vc.MemoryWriteTool(cfg).execute({
+            "name": "real", "type": "user",
+            "description": "ok", "content": "x",
+        })
+        # noise files
+        (tmp_path / "memory" / "junk.txt").write_text("ignore", encoding="utf-8")
+        r = vc.MemoryListTool(cfg).execute({})
+        assert "real" in r
+        assert "junk" not in r
+        assert "MEMORY" not in r  # index file not listed as an entry
+
+
+class TestMemoryLoadBlock:
+
+    def test_returns_empty_when_no_index(self, tmp_path):
+        cfg = _make_memory_config(tmp_path)
+        assert vc._load_memory_block(cfg) == ""
+
+    def test_returns_block_with_guidance_and_body(self, tmp_path):
+        cfg = _make_memory_config(tmp_path)
+        vc.MemoryWriteTool(cfg).execute({
+            "name": "u", "type": "user",
+            "description": "user desc", "content": "x",
+        })
+        block = vc._load_memory_block(cfg)
+        assert block.startswith("\n# Memory\n")
+        assert "user desc" in block
+        # guidance text present
+        assert "MemoryWrite" in block
+
+    def test_truncates_long_index(self, tmp_path):
+        cfg = _make_memory_config(tmp_path)
+        index = tmp_path / "memory" / "MEMORY.md"
+        index.write_text("\n".join(f"- [m{i}](m{i}.md) — desc {i}"
+                                   for i in range(vc.MEMORY_INDEX_MAX_LINES + 50)),
+                         encoding="utf-8")
+        block = vc._load_memory_block(cfg)
+        assert "truncated" in block
+        # last line beyond cap should NOT be in block
+        last_kept = vc.MEMORY_INDEX_MAX_LINES - 1
+        assert f"m{last_kept}](m{last_kept}.md)" in block
+        beyond = vc.MEMORY_INDEX_MAX_LINES + 10
+        assert f"m{beyond}](m{beyond}.md)" not in block
+
+    def test_refuses_symlinked_index(self, tmp_path):
+        cfg = _make_memory_config(tmp_path)
+        target = tmp_path / "real_index.md"
+        target.write_text("- [foo](foo.md) — bar\n", encoding="utf-8")
+        link = tmp_path / "memory" / "MEMORY.md"
+        os.symlink(str(target), str(link))
+        assert vc._load_memory_block(cfg) == ""
+
+
+class TestMemorySystemPromptInjection:
+
+    def test_prompt_includes_memory_when_present(self, tmp_path):
+        cfg = _make_memory_config(tmp_path)
+        # avoid pulling in CLAUDE.md from cwd or HOME
+        cfg.cwd = str(tmp_path / "isolated_cwd")
+        os.makedirs(cfg.cwd)
+        vc.MemoryWriteTool(cfg).execute({
+            "name": "fact", "type": "project",
+            "description": "ship date is 2026-06-01", "content": "x",
+        })
+        prompt = vc._build_system_prompt(cfg)
+        assert "# Memory" in prompt
+        assert "ship date is 2026-06-01" in prompt
+
+    def test_prompt_omits_memory_when_absent(self, tmp_path):
+        cfg = _make_memory_config(tmp_path)
+        cfg.cwd = str(tmp_path / "isolated_cwd")
+        os.makedirs(cfg.cwd)
+        prompt = vc._build_system_prompt(cfg)
+        assert "# Memory" not in prompt
