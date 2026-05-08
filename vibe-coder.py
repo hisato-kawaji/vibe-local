@@ -4312,6 +4312,129 @@ class MemoryListTool(Tool):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# Hooks — Event-driven shell commands loaded from settings.json
+# ════════════════════════════════════════════════════════════════════════════════
+
+HOOK_EVENTS = ("PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SessionStart")
+HOOK_DEFAULT_TIMEOUT_S = 30
+HOOK_OUTPUT_MAX_CHARS = 4000
+HOOK_BLOCKING_EVENTS = frozenset({"PreToolUse", "UserPromptSubmit"})
+
+
+class HooksManager:
+    """Loads ~/.config/vibe-local/settings.json and runs hooks on lifecycle events.
+
+    Settings format (Claude Code-compatible subset):
+
+        {
+          "hooks": {
+            "PreToolUse": [
+              {"matcher": "Bash|Edit",
+               "hooks": [{"type": "command", "command": "audit.sh", "timeout_s": 10}]}
+            ],
+            "PostToolUse": [...],
+            "UserPromptSubmit": [...],
+            "Stop": [...],
+            "SessionStart": [...]
+          }
+        }
+
+    Each hook receives the event payload as JSON on stdin. For PreToolUse and
+    UserPromptSubmit, exit code != 0 blocks downstream execution and the hook's
+    stdout/stderr is surfaced as the block reason. PostToolUse / Stop /
+    SessionStart cannot block — their stdout is appended to the relevant
+    artifact (PostToolUse → tool result; others → printed to stderr if non-empty).
+    """
+
+    def __init__(self, config):
+        self.config = config
+        self.settings_path = os.path.join(config.config_dir, "settings.json")
+        self._raw = self._load_settings()
+
+    def _load_settings(self):
+        path = self.settings_path
+        if not os.path.isfile(path) or os.path.islink(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"{C.YELLOW}Warning: failed to load {path}: {e}{C.RESET}", file=sys.stderr)
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _entries_for(self, event):
+        hooks_root = self._raw.get("hooks") if isinstance(self._raw, dict) else None
+        if not isinstance(hooks_root, dict):
+            return []
+        entries = hooks_root.get(event)
+        return entries if isinstance(entries, list) else []
+
+    @staticmethod
+    def _matches(matcher, tool_name):
+        if not matcher:
+            return True
+        for part in str(matcher).split("|"):
+            if part.strip() == tool_name:
+                return True
+        return False
+
+    @staticmethod
+    def _run_command(command, payload, timeout):
+        try:
+            proc = subprocess.run(
+                command,
+                shell=True,
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            output = (proc.stdout or "") + (proc.stderr or "")
+            if len(output) > HOOK_OUTPUT_MAX_CHARS:
+                output = output[:HOOK_OUTPUT_MAX_CHARS] + "\n[hook output truncated]"
+            return proc.returncode, output.strip()
+        except subprocess.TimeoutExpired:
+            return 124, f"hook timed out after {timeout}s"
+        except (OSError, ValueError) as e:
+            return 1, f"hook execution error: {e}"
+
+    def has_hooks(self, event):
+        return bool(self._entries_for(event))
+
+    def run(self, event, payload):
+        """Run all hooks for `event`. Returns (allow, output)."""
+        if event not in HOOK_EVENTS:
+            return True, ""
+        outputs = []
+        tool_name = payload.get("tool_name", "") if isinstance(payload, dict) else ""
+        for entry in self._entries_for(event):
+            if not isinstance(entry, dict):
+                continue
+            if not self._matches(entry.get("matcher"), tool_name):
+                continue
+            for hook in entry.get("hooks") or []:
+                if not isinstance(hook, dict):
+                    continue
+                command = hook.get("command")
+                if not command or not isinstance(command, str):
+                    continue
+                try:
+                    timeout = int(hook.get("timeout_s", HOOK_DEFAULT_TIMEOUT_S))
+                except (TypeError, ValueError):
+                    timeout = HOOK_DEFAULT_TIMEOUT_S
+                if timeout <= 0 or timeout > 600:
+                    timeout = HOOK_DEFAULT_TIMEOUT_S
+                rc, out = self._run_command(command, payload, timeout)
+                if out:
+                    outputs.append(out)
+                if rc != 0 and event in HOOK_BLOCKING_EVENTS:
+                    reason = "\n".join(outputs) or f"hook exit {rc}"
+                    return False, reason
+        return True, "\n".join(outputs)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Sub-Agent — Spawns a mini agent loop in a separate thread
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -7004,7 +7127,7 @@ class Agent:
     ACT_ONLY_TOOLS = {"Bash", "Write", "Edit", "NotebookEdit"}
 
     def __init__(self, config, client, registry, permissions, session, tui,
-                 rag_engine=None):
+                 rag_engine=None, hooks=None):
         self.config = config
         self.client = client
         self.registry = registry
@@ -7012,6 +7135,7 @@ class Agent:
         self.session = session
         self.tui = tui
         self.rag_engine = rag_engine
+        self.hooks = hooks
         self._interrupted = threading.Event()
         self._tui_lock = threading.Lock()
         self._plan_mode = False
@@ -7312,9 +7436,25 @@ class Agent:
                     def _exec_one(item):
                         tc_id, tool_name, tool_params, tool = item
                         try:
+                            # PreToolUse hook
+                            if self.hooks and self.hooks.has_hooks("PreToolUse"):
+                                allow, hook_out = self.hooks.run("PreToolUse",
+                                    {"tool_name": tool_name, "tool_input": tool_params})
+                                if not allow:
+                                    _parallel_durations[tc_id] = 0.0
+                                    return ToolResult(tc_id,
+                                        f"Blocked by PreToolUse hook: {hook_out}", True)
                             _t0 = time.time()
                             output = tool.execute(tool_params)
                             _parallel_durations[tc_id] = time.time() - _t0
+                            # PostToolUse hook
+                            if self.hooks and self.hooks.has_hooks("PostToolUse"):
+                                preview = output if isinstance(output, str) else str(output)
+                                _, hook_out = self.hooks.run("PostToolUse",
+                                    {"tool_name": tool_name, "tool_input": tool_params,
+                                     "tool_result": preview[:2000]})
+                                if hook_out and isinstance(output, str):
+                                    output = f"{output}\n\n[PostToolUse hook output]\n{hook_out}"
                             return ToolResult(tc_id, output)
                         except Exception as e:
                             _parallel_durations[tc_id] = time.time() - _t0
@@ -7356,6 +7496,17 @@ class Agent:
                         if self._interrupted.is_set() or _esc_monitor.pressed:
                             break
                         try:
+                            # PreToolUse hook (block if exit != 0)
+                            if self.hooks and self.hooks.has_hooks("PreToolUse"):
+                                allow, hook_out = self.hooks.run("PreToolUse",
+                                    {"tool_name": tool_name, "tool_input": tool_params})
+                                if not allow:
+                                    block_msg = f"Blocked by PreToolUse hook: {hook_out}"
+                                    self.tui.show_tool_result(tool_name, block_msg, True,
+                                                              params=tool_params)
+                                    results.append(ToolResult(tc_id, block_msg, True))
+                                    continue
+
                             # Git checkpoint before write/edit operations
                             if tool_name in ("Write", "Edit") and self.git_checkpoint._is_git_repo:
                                 self.git_checkpoint.create(f"before-{tool_name.lower()}")
@@ -7368,6 +7519,16 @@ class Agent:
                             _tool_dur = time.time() - _tool_t0
                             if is_long_op:
                                 self.tui.stop_spinner()
+
+                            # PostToolUse hook (cannot block; output is appended to result)
+                            if self.hooks and self.hooks.has_hooks("PostToolUse"):
+                                preview = output if isinstance(output, str) else str(output)
+                                _, hook_out = self.hooks.run("PostToolUse",
+                                    {"tool_name": tool_name, "tool_input": tool_params,
+                                     "tool_result": preview[:2000]})
+                                if hook_out and isinstance(output, str):
+                                    output = f"{output}\n\n[PostToolUse hook output]\n{hook_out}"
+
                             _is_err = isinstance(output, str) and (
                                 output.startswith("Error:") or output.startswith("Error -")
                             )
@@ -7811,8 +7972,14 @@ def main():
         except Exception as e:
             print(f"{C.YELLOW}Warning: MCP server '{srv_name}' failed: {e}{C.RESET}", file=sys.stderr)
 
+    hooks = HooksManager(config)
     agent = Agent(config, client, registry, permissions, session, tui,
-                  rag_engine=_rag_engine)
+                  rag_engine=_rag_engine, hooks=hooks)
+    if hooks.has_hooks("SessionStart"):
+        try:
+            hooks.run("SessionStart", {"cwd": config.cwd, "model": config.model})
+        except Exception:
+            pass
 
     # Handle Ctrl+C gracefully
     def signal_handler(sig, frame):
@@ -7885,7 +8052,17 @@ def main():
 
     # One-shot mode
     if config.prompt:
+        if hooks.has_hooks("UserPromptSubmit"):
+            _allow, _msg = hooks.run("UserPromptSubmit", {"prompt": config.prompt})
+            if not _allow:
+                print(f"{C.YELLOW}One-shot prompt blocked by UserPromptSubmit hook: {_msg}{C.RESET}")
+                return
         agent.run(config.prompt)
+        if hooks.has_hooks("Stop"):
+            try:
+                hooks.run("Stop", {})
+            except Exception:
+                pass
         session.save()
         return
 
@@ -7933,6 +8110,13 @@ def main():
                 print(f"\n  {_ansi(chr(27)+'[38;5;51m')}✦ Session saved. Duration: {_dur}, {_new_msgs} new messages.{C.RESET}")
                 print(f"  {_ansi(chr(27)+'[38;5;240m')}Resume anytime: vibe-local --resume{C.RESET}\n")
                 break
+
+            # UserPromptSubmit hook (block downstream if exit != 0)
+            if hooks.has_hooks("UserPromptSubmit"):
+                _hook_allow, _hook_msg = hooks.run("UserPromptSubmit", {"prompt": user_input})
+                if not _hook_allow:
+                    print(f"{C.YELLOW}Input blocked by UserPromptSubmit hook: {_hook_msg}{C.RESET}")
+                    continue
 
             # Handle commands
             if user_input.startswith("/"):
@@ -8464,6 +8648,12 @@ def main():
 
             # Run agent
             agent.run(user_input)
+            # Stop hook (cannot block; runs after each assistant turn)
+            if hooks.has_hooks("Stop"):
+                try:
+                    hooks.run("Stop", {})
+                except Exception:
+                    pass
             # Capture type-ahead for next prompt (text typed during execution)
             _typeahead_text = agent.get_typeahead()
             if _typeahead_text:

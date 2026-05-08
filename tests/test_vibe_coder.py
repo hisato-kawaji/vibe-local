@@ -10547,3 +10547,251 @@ class TestMemorySystemPromptInjection:
         os.makedirs(cfg.cwd)
         prompt = vc._build_system_prompt(cfg)
         assert "# Memory" not in prompt
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Hooks — settings.json-based event-driven shell hooks
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _make_hooks_config(tmp_path):
+    """Build a Config-like object with config_dir under tmp_path."""
+    cfg = vc.Config()
+    cfg.config_dir = str(tmp_path / "cfg")
+    os.makedirs(cfg.config_dir, mode=0o700, exist_ok=True)
+    return cfg
+
+
+def _write_settings(cfg, data):
+    path = os.path.join(cfg.config_dir, "settings.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    return path
+
+
+class TestHooksLoading:
+
+    def test_no_settings_file_yields_empty_manager(self, tmp_path):
+        cfg = _make_hooks_config(tmp_path)
+        hm = vc.HooksManager(cfg)
+        assert hm.has_hooks("PreToolUse") is False
+        ok, out = hm.run("PreToolUse", {"tool_name": "Bash"})
+        assert ok is True
+        assert out == ""
+
+    def test_malformed_json_does_not_crash(self, tmp_path, capsys):
+        cfg = _make_hooks_config(tmp_path)
+        path = os.path.join(cfg.config_dir, "settings.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{not valid json")
+        hm = vc.HooksManager(cfg)
+        assert hm.has_hooks("PreToolUse") is False
+
+    def test_symlinked_settings_is_refused(self, tmp_path):
+        cfg = _make_hooks_config(tmp_path)
+        target = tmp_path / "evil.json"
+        target.write_text(json.dumps({
+            "hooks": {"PreToolUse": [{"hooks": [{"command": "true"}]}]}
+        }), encoding="utf-8")
+        link = os.path.join(cfg.config_dir, "settings.json")
+        os.symlink(str(target), link)
+        hm = vc.HooksManager(cfg)
+        assert hm.has_hooks("PreToolUse") is False
+
+    def test_valid_settings_loads(self, tmp_path):
+        cfg = _make_hooks_config(tmp_path)
+        _write_settings(cfg, {
+            "hooks": {
+                "PreToolUse": [{"matcher": "Bash",
+                                "hooks": [{"command": "true"}]}]
+            }
+        })
+        hm = vc.HooksManager(cfg)
+        assert hm.has_hooks("PreToolUse") is True
+        assert hm.has_hooks("PostToolUse") is False
+
+
+class TestHooksMatcher:
+
+    def test_no_matcher_matches_all(self):
+        assert vc.HooksManager._matches(None, "Bash") is True
+        assert vc.HooksManager._matches("", "Bash") is True
+
+    def test_exact_match(self):
+        assert vc.HooksManager._matches("Bash", "Bash") is True
+        assert vc.HooksManager._matches("Bash", "Edit") is False
+
+    def test_pipe_alternation(self):
+        assert vc.HooksManager._matches("Edit|Write", "Edit") is True
+        assert vc.HooksManager._matches("Edit|Write", "Write") is True
+        assert vc.HooksManager._matches("Edit|Write", "Read") is False
+
+    def test_pipe_with_whitespace(self):
+        assert vc.HooksManager._matches("Edit | Write", "Edit") is True
+
+
+class TestHooksRunPreToolUse:
+
+    def test_exit_zero_allows(self, tmp_path):
+        cfg = _make_hooks_config(tmp_path)
+        _write_settings(cfg, {
+            "hooks": {"PreToolUse": [{"matcher": "Bash",
+                                      "hooks": [{"command": "true"}]}]}
+        })
+        hm = vc.HooksManager(cfg)
+        ok, out = hm.run("PreToolUse", {"tool_name": "Bash", "tool_input": {}})
+        assert ok is True
+
+    def test_exit_nonzero_blocks(self, tmp_path):
+        cfg = _make_hooks_config(tmp_path)
+        _write_settings(cfg, {
+            "hooks": {"PreToolUse": [{"matcher": "Bash",
+                                      "hooks": [{"command": "echo deny >&2; exit 1"}]}]}
+        })
+        hm = vc.HooksManager(cfg)
+        ok, out = hm.run("PreToolUse", {"tool_name": "Bash", "tool_input": {}})
+        assert ok is False
+        assert "deny" in out
+
+    def test_matcher_skips_non_matching_tool(self, tmp_path):
+        cfg = _make_hooks_config(tmp_path)
+        _write_settings(cfg, {
+            "hooks": {"PreToolUse": [{"matcher": "Edit",
+                                      "hooks": [{"command": "exit 1"}]}]}
+        })
+        hm = vc.HooksManager(cfg)
+        ok, _out = hm.run("PreToolUse", {"tool_name": "Bash"})
+        assert ok is True  # matcher didn't fire, so no block
+
+    def test_receives_payload_on_stdin(self, tmp_path):
+        cfg = _make_hooks_config(tmp_path)
+        marker = tmp_path / "marker.txt"
+        # cat stdin into file then exit 0
+        cmd = f"cat > {marker}"
+        _write_settings(cfg, {
+            "hooks": {"PreToolUse": [{"hooks": [{"command": cmd}]}]}
+        })
+        hm = vc.HooksManager(cfg)
+        ok, _ = hm.run("PreToolUse", {"tool_name": "Bash", "tool_input": {"x": 1}})
+        assert ok is True
+        captured = marker.read_text(encoding="utf-8")
+        assert "Bash" in captured
+        assert '"x": 1' in captured
+
+
+class TestHooksRunPostToolUse:
+
+    def test_does_not_block_on_nonzero(self, tmp_path):
+        cfg = _make_hooks_config(tmp_path)
+        _write_settings(cfg, {
+            "hooks": {"PostToolUse": [{"hooks": [{"command": "echo bad; exit 7"}]}]}
+        })
+        hm = vc.HooksManager(cfg)
+        ok, out = hm.run("PostToolUse", {"tool_name": "Bash"})
+        assert ok is True   # PostToolUse cannot block
+        assert "bad" in out
+
+    def test_captures_output(self, tmp_path):
+        cfg = _make_hooks_config(tmp_path)
+        _write_settings(cfg, {
+            "hooks": {"PostToolUse": [{"hooks": [{"command": "echo lint-pass"}]}]}
+        })
+        hm = vc.HooksManager(cfg)
+        ok, out = hm.run("PostToolUse", {"tool_name": "Edit"})
+        assert ok is True
+        assert out.strip() == "lint-pass"
+
+
+class TestHooksTimeout:
+
+    def test_timeout_triggers(self, tmp_path):
+        cfg = _make_hooks_config(tmp_path)
+        _write_settings(cfg, {
+            "hooks": {"PreToolUse": [
+                {"hooks": [{"command": "sleep 5", "timeout_s": 1}]}
+            ]}
+        })
+        hm = vc.HooksManager(cfg)
+        ok, out = hm.run("PreToolUse", {"tool_name": "Bash"})
+        # PreToolUse should block on timeout (rc=124)
+        assert ok is False
+        assert "timed out" in out
+
+    def test_invalid_timeout_falls_back_to_default(self, tmp_path):
+        cfg = _make_hooks_config(tmp_path)
+        _write_settings(cfg, {
+            "hooks": {"PreToolUse": [
+                {"hooks": [{"command": "true", "timeout_s": "abc"}]}
+            ]}
+        })
+        hm = vc.HooksManager(cfg)
+        ok, _ = hm.run("PreToolUse", {"tool_name": "Bash"})
+        assert ok is True  # ran successfully with default timeout
+
+
+class TestHooksMultipleAndMisc:
+
+    def test_multiple_hooks_concat_output(self, tmp_path):
+        cfg = _make_hooks_config(tmp_path)
+        _write_settings(cfg, {
+            "hooks": {"PostToolUse": [
+                {"hooks": [
+                    {"command": "echo first"},
+                    {"command": "echo second"},
+                ]}
+            ]}
+        })
+        hm = vc.HooksManager(cfg)
+        _ok, out = hm.run("PostToolUse", {"tool_name": "Bash"})
+        assert "first" in out
+        assert "second" in out
+
+    def test_unknown_event_is_no_op(self, tmp_path):
+        cfg = _make_hooks_config(tmp_path)
+        _write_settings(cfg, {"hooks": {"Bogus": [{"hooks": [{"command": "exit 1"}]}]}})
+        hm = vc.HooksManager(cfg)
+        ok, out = hm.run("Bogus", {})
+        assert ok is True
+        assert out == ""
+
+    def test_hook_without_command_is_skipped(self, tmp_path):
+        cfg = _make_hooks_config(tmp_path)
+        _write_settings(cfg, {
+            "hooks": {"PreToolUse": [
+                {"hooks": [{"type": "command"}]},  # no command field
+                {"hooks": [{"command": "true"}]},
+            ]}
+        })
+        hm = vc.HooksManager(cfg)
+        ok, _ = hm.run("PreToolUse", {"tool_name": "Bash"})
+        assert ok is True
+
+    def test_session_start_does_not_block(self, tmp_path):
+        cfg = _make_hooks_config(tmp_path)
+        _write_settings(cfg, {
+            "hooks": {"SessionStart": [{"hooks": [{"command": "exit 1"}]}]}
+        })
+        hm = vc.HooksManager(cfg)
+        ok, _ = hm.run("SessionStart", {"cwd": "/x"})
+        assert ok is True  # SessionStart cannot block
+
+
+class TestAgentAcceptsHooks:
+    """Just verify Agent can be constructed with hooks=... and exposes the field."""
+
+    def test_agent_accepts_hooks_kwarg(self, tmp_path):
+        cfg = _make_hooks_config(tmp_path)
+        cfg.cwd = str(tmp_path)
+        # Build minimal session/registry/permissions/tui — only need Agent ctor to not crash
+        session = vc.Session(cfg, "system")
+        registry = vc.ToolRegistry()
+        permissions = vc.PermissionMgr(cfg)
+        tui = vc.TUI.__new__(vc.TUI)
+        tui.is_interactive = False
+        tui._spinner_active = False
+        tui.scroll_region = mock.MagicMock()
+        tui._scroll_print = lambda *a, **kw: None
+        client = mock.MagicMock()
+        hm = vc.HooksManager(cfg)
+        agent = vc.Agent(cfg, client, registry, permissions, session, tui,
+                         rag_engine=None, hooks=hm)
+        assert agent.hooks is hm
